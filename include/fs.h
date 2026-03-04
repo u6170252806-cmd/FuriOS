@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "syscall.h"
+#include "nvme.h"
 
 #define INODE_NAME_MAX 31
 #define DIR_MAX_CHILDREN 32
@@ -35,14 +36,8 @@ typedef enum {
     DEV_SDF = 10,
     DEV_SDG = 11,
     DEV_SDH = 12,
-    DEV_NVME0N1 = 13,
-    DEV_NVME1N1 = 14,
-    DEV_NVME2N1 = 15,
-    DEV_NVME3N1 = 16,
-    DEV_NVME4N1 = 17,
-    DEV_NVME5N1 = 18,
-    DEV_NVME6N1 = 19,
-    DEV_NVME7N1 = 20,
+    DEV_NVME_BASE = 13,
+    DEV_NVME_LAST = DEV_NVME_BASE + (NVME_MAX_CONTROLLERS * NVME_MAX_NAMESPACES) - 1,
 } dev_kind_t;
 
 typedef struct inode inode_t;
@@ -79,16 +74,22 @@ int fs_link(const char *old_path, const char *new_path);
 int fs_symlink(const char *target, const char *link_path);
 int fs_readlink(const char *path, char *buf, size_t buflen);
 int fs_lstat(const char *path, fu_stat_t *st);
+int fs_stat(const char *path, fu_stat_t *st);
+int fs_stat_inode(inode_t *inode, fu_stat_t *st);
+int fs_chmod(const char *path, uint32_t mode);
 int fs_unlink(const char *path);
 int fs_rmdir(const char *path);
 int fs_rename(const char *old_path, const char *new_path);
 int fs_read(inode_t *inode, size_t *offset, void *buf, size_t len);
 int fs_write(inode_t *inode, size_t *offset, const void *buf, size_t len);
 int fs_truncate(inode_t *inode, size_t size);
+int fs_sync_inode(inode_t *inode);
+int fs_sync_all(void);
 int fs_mount(const char *source, const char *target, const char *fstype, uint64_t flags);
 int fs_umount(const char *target, uint64_t flags);
 int fs_mkfs_ext4(const char *target, uint64_t flags, const fu_mkfs_ext4_opts_t *opts);
 int fs_fsck_ext4(const char *target, uint64_t flags);
 bool fs_is_tty(const inode_t *inode);
+bool fs_is_block_dev(const inode_t *inode);
 
 #endif

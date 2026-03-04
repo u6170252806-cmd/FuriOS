@@ -99,6 +99,42 @@ static int parse_features(char *list, uint32_t *mask) {
             }
             continue;
         }
+        if (strcmp(tok, "baseline") == 0) {
+            uint32_t preset = MKFS_EXT4_FEAT_EXTENTS |
+                              MKFS_EXT4_FEAT_SPARSE_SUPER |
+                              MKFS_EXT4_FEAT_HAS_JOURNAL;
+            if (on) {
+                *mask |= preset;
+            } else {
+                *mask &= ~preset;
+            }
+            continue;
+        }
+        if (strcmp(tok, "kernelrw") == 0) {
+            uint32_t preset = MKFS_EXT4_FEAT_EXTENTS |
+                              MKFS_EXT4_FEAT_64BIT |
+                              MKFS_EXT4_FEAT_SPARSE_SUPER |
+                              MKFS_EXT4_FEAT_HAS_JOURNAL;
+            if (on) {
+                *mask |= preset;
+            } else {
+                *mask &= ~preset;
+            }
+            continue;
+        }
+        if (strcmp(tok, "modern") == 0) {
+            uint32_t preset = MKFS_EXT4_FEAT_EXTENTS |
+                              MKFS_EXT4_FEAT_64BIT |
+                              MKFS_EXT4_FEAT_METADATA_CSUM |
+                              MKFS_EXT4_FEAT_SPARSE_SUPER |
+                              MKFS_EXT4_FEAT_HAS_JOURNAL;
+            if (on) {
+                *mask |= preset;
+            } else {
+                *mask &= ~preset;
+            }
+            continue;
+        }
         if (strcmp(tok, "extents") == 0) {
             set_feature(mask, MKFS_EXT4_FEAT_EXTENTS, on);
             continue;
@@ -163,15 +199,18 @@ static int parse_extended(char *list, uint16_t *stride_out, uint32_t *journal_bl
 
 static void usage(void) {
     puts("usage: mkfs.ext4 [-L label] [-U uuid|random] [-m reserved_pct] ");
-    puts("[-i bytes-per-inode] [-T default|small|largefile] ");
+    puts("[-i bytes-per-inode] [-T default|small|largefile|largefile4] ");
+    puts("[-K|--strict-kernel] ");
     puts("[-E stride=N,journal_blocks=N] [-O feat[,feat...]] <device>\n");
 }
 
 int main(int argc, char **argv) {
     fu_mkfs_ext4_opts_t opts;
+    unsigned long mkfs_flags = 0;
     memset(&opts, 0, sizeof(opts));
     opts.size = sizeof(opts);
     opts.feature_flags = MKFS_EXT4_FEAT_EXTENTS |
+                         MKFS_EXT4_FEAT_64BIT |
                          MKFS_EXT4_FEAT_SPARSE_SUPER |
                          MKFS_EXT4_FEAT_HAS_JOURNAL;
     opts.profile = MKFS_EXT4_PROFILE_DEFAULT;
@@ -254,10 +293,16 @@ int main(int argc, char **argv) {
                 opts.profile = MKFS_EXT4_PROFILE_SMALL;
             } else if (strcmp(profile, "largefile") == 0) {
                 opts.profile = MKFS_EXT4_PROFILE_LARGEFILE;
+            } else if (strcmp(profile, "largefile4") == 0) {
+                opts.profile = MKFS_EXT4_PROFILE_LARGEFILE4;
             } else {
                 puts("mkfs.ext4: invalid -T profile\n");
                 return 1;
             }
+            continue;
+        }
+        if (strcmp(argv[i], "-K") == 0 || strcmp(argv[i], "--strict-kernel") == 0) {
+            mkfs_flags |= MKFS_EXT4_F_STRICT_KERNEL;
             continue;
         }
         if (strcmp(argv[i], "-E") == 0) {
@@ -283,7 +328,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (sys_mkfsext4(target, 0, &opts) != 0) {
+    if (sys_mkfsext4(target, mkfs_flags, &opts) != 0) {
         puts("mkfs.ext4: failed\n");
         return 1;
     }

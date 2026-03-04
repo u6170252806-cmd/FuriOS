@@ -32,15 +32,25 @@ int main(int argc, char **argv) {
     } else if (argc == 3 && argv[1][0] == '-') {
         if (strcmp(argv[1], "-9") == 0 || strcmp(argv[1], "-KILL") == 0) {
             sig = SIGKILL;
+        } else if (strcmp(argv[1], "-1") == 0 || strcmp(argv[1], "-HUP") == 0) {
+            sig = SIGHUP;
+        } else if (strcmp(argv[1], "-2") == 0 || strcmp(argv[1], "-INT") == 0) {
+            sig = SIGINT;
+        } else if (strcmp(argv[1], "-3") == 0 || strcmp(argv[1], "-QUIT") == 0) {
+            sig = SIGQUIT;
+        } else if (strcmp(argv[1], "-18") == 0 || strcmp(argv[1], "-CONT") == 0) {
+            sig = SIGCONT;
+        } else if (strcmp(argv[1], "-19") == 0 || strcmp(argv[1], "-STOP") == 0) {
+            sig = SIGSTOP;
         } else if (strcmp(argv[1], "-15") == 0 || strcmp(argv[1], "-TERM") == 0) {
             sig = SIGTERM;
         } else {
-            puts("usage: kill [-9|-15] <pid>\n");
+            puts("usage: kill [-1|-2|-3|-9|-15|-18|-19] <pid>\n");
             return 1;
         }
         pid_arg = argv[2];
     } else {
-        puts("usage: kill [-9|-15] <pid>\n");
+        puts("usage: kill [-1|-2|-3|-9|-15|-18|-19] <pid>\n");
         return 1;
     }
 

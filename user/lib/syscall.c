@@ -74,6 +74,18 @@ int sys_kill(int pid, int sig) {
     return (int)syscall6(SYS_KILL, pid, sig, 0, 0, 0, 0);
 }
 
+int sys_sigaction(int sig, const fu_sigaction_t *act, fu_sigaction_t *oldact) {
+    return (int)syscall6(SYS_SIGACTION, sig, (long)act, (long)oldact, 0, 0, 0);
+}
+
+int sys_sigprocmask(int how, uint64_t set, uint64_t *oldset) {
+    return (int)syscall6(SYS_SIGPROCMASK, how, (long)set, (long)oldset, 0, 0, 0);
+}
+
+int sys_sigreturn(void) {
+    return (int)syscall6(SYS_SIGRETURN, 0, 0, 0, 0, 0, 0);
+}
+
 int sys_fcntl(int fd, int cmd, int arg) {
     return (int)syscall6(SYS_FCNTL, fd, cmd, arg, 0, 0, 0);
 }
@@ -116,6 +128,14 @@ int sys_munmap(void *addr, unsigned long len) {
 
 int sys_mprotect(void *addr, unsigned long len, int prot) {
     return (int)syscall6(SYS_MPROTECT, (long)addr, (long)len, prot, 0, 0, 0);
+}
+
+int sys_fsync(int fd) {
+    return (int)syscall6(SYS_FSYNC, (long)fd, 0, 0, 0, 0, 0);
+}
+
+int sys_msync(void *addr, unsigned long len, unsigned long flags) {
+    return (int)syscall6(SYS_MSYNC, (long)addr, (long)len, (long)flags, 0, 0, 0);
 }
 
 int sys_chdir(const char *path) {
@@ -174,6 +194,22 @@ int sys_readlink(const char *path, char *buf, unsigned long buflen) {
 
 int sys_lstat(const char *path, fu_stat_t *st) {
     return (int)syscall6(SYS_LSTAT, (long)path, (long)st, 0, 0, 0, 0);
+}
+
+int sys_stat(const char *path, fu_stat_t *st) {
+    return (int)syscall6(SYS_STAT, (long)path, (long)st, 0, 0, 0, 0);
+}
+
+int sys_fstat(int fd, fu_stat_t *st) {
+    return (int)syscall6(SYS_FSTAT, (long)fd, (long)st, 0, 0, 0, 0);
+}
+
+long sys_lseek(int fd, long offset, int whence) {
+    return syscall6(SYS_LSEEK, (long)fd, offset, (long)whence, 0, 0, 0);
+}
+
+int sys_chmod(const char *path, uint32_t mode) {
+    return (int)syscall6(SYS_CHMOD, (long)path, (long)mode, 0, 0, 0, 0);
 }
 
 int sys_dup2(int oldfd, int newfd) {

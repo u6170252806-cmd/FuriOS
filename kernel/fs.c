@@ -16,7 +16,6 @@
 #define INODE_POOL_MAX 128
 #define MOUNT_TABLE_MAX 4
 #define DEV_PARTS_PER_DISK_MAX 16
-#define NVME_DEV_MAX (DEV_NVME7N1 - DEV_NVME0N1 + 1)
 
 typedef struct {
     bool used;
@@ -37,6 +36,10 @@ extern uint8_t _binary_build_user_echo_elf_start[];
 extern uint8_t _binary_build_user_echo_elf_end[];
 extern uint8_t _binary_build_user_clear_elf_start[];
 extern uint8_t _binary_build_user_clear_elf_end[];
+extern uint8_t _binary_build_user_nano_elf_start[];
+extern uint8_t _binary_build_user_nano_elf_end[];
+extern uint8_t _binary_build_user_elfinfo_elf_start[];
+extern uint8_t _binary_build_user_elfinfo_elf_end[];
 extern uint8_t _binary_build_user_mkdir_elf_start[];
 extern uint8_t _binary_build_user_mkdir_elf_end[];
 extern uint8_t _binary_build_user_rmdir_elf_start[];
@@ -61,16 +64,504 @@ extern uint8_t _binary_build_user_umount_elf_start[];
 extern uint8_t _binary_build_user_umount_elf_end[];
 extern uint8_t _binary_build_user_ln_elf_start[];
 extern uint8_t _binary_build_user_ln_elf_end[];
+extern uint8_t _binary_build_user_chmod_elf_start[];
+extern uint8_t _binary_build_user_chmod_elf_end[];
 extern uint8_t _binary_build_user_mkfs_ext4_elf_start[];
 extern uint8_t _binary_build_user_mkfs_ext4_elf_end[];
 extern uint8_t _binary_build_user_fsck_ext4_elf_start[];
 extern uint8_t _binary_build_user_fsck_ext4_elf_end[];
+extern uint8_t _binary_build_user_tcc_elf_start[];
+extern uint8_t _binary_build_user_tcc_elf_end[];
+extern uint8_t _binary_build_user_ar_elf_start[];
+extern uint8_t _binary_build_user_ar_elf_end[];
+extern uint8_t _binary_build_user_ranlib_elf_start[];
+extern uint8_t _binary_build_user_ranlib_elf_end[];
+extern uint8_t _binary_build_user_as_elf_start[];
+extern uint8_t _binary_build_user_as_elf_end[];
+extern uint8_t _binary_build_user_ld_furios_elf_start[];
+extern uint8_t _binary_build_user_ld_furios_elf_end[];
+extern uint8_t _binary_build_tccrt_crt1_o_start[];
+extern uint8_t _binary_build_tccrt_crt1_o_end[];
+extern uint8_t _binary_build_tccrt_crti_o_start[];
+extern uint8_t _binary_build_tccrt_crti_o_end[];
+extern uint8_t _binary_build_tccrt_crtn_o_start[];
+extern uint8_t _binary_build_tccrt_crtn_o_end[];
+extern uint8_t _binary_build_tccrt_crtbegin_o_start[];
+extern uint8_t _binary_build_tccrt_crtbegin_o_end[];
+extern uint8_t _binary_build_tccrt_crtend_o_start[];
+extern uint8_t _binary_build_tccrt_crtend_o_end[];
+extern uint8_t _binary_build_tccrt_libc_a_start[];
+extern uint8_t _binary_build_tccrt_libc_a_end[];
+extern uint8_t _binary_build_tccrt_libtcc1_a_start[];
+extern uint8_t _binary_build_tccrt_libtcc1_a_end[];
+extern uint8_t _binary_third_party_tinycc_include_tccdefs_h_start[];
+extern uint8_t _binary_third_party_tinycc_include_tccdefs_h_end[];
 
 static inode_t inode_pool[INODE_POOL_MAX];
 static inode_t *root_inode;
 static inode_t *dev_root_inode;
 static mount_entry_t mount_table[MOUNT_TABLE_MAX];
 static void fs_sync_hotplug_block_devs(void);
+
+static const char sdk_furios_h[] =
+    "#ifndef FUROS_SDK_FURIOS_H\n"
+    "#define FUROS_SDK_FURIOS_H\n"
+    "#include <stddef.h>\n"
+    "#include <stdint.h>\n"
+    "#include <stdarg.h>\n"
+    "#define O_RDONLY 0\n"
+    "#define O_WRONLY 1\n"
+    "#define O_RDWR 2\n"
+    "#define O_ACCMODE 0x3\n"
+    "#define O_CREAT 0x40\n"
+    "#define O_TRUNC 0x200\n"
+    "#define O_APPEND 0x400\n"
+    "#define O_NONBLOCK 0x800\n"
+    "#define F_GETFL 3\n"
+    "#define F_SETFL 4\n"
+    "#define SEEK_SET 0\n"
+    "#define SEEK_CUR 1\n"
+    "#define SEEK_END 2\n"
+    "#define PROT_NONE 0x0\n"
+    "#define PROT_READ 0x1\n"
+    "#define PROT_WRITE 0x2\n"
+    "#define PROT_EXEC 0x4\n"
+    "#define MAP_SHARED 0x01\n"
+    "#define MAP_PRIVATE 0x02\n"
+    "#define MAP_FIXED 0x10\n"
+    "#define MAP_ANONYMOUS 0x20\n"
+    "#define MAP_FAILED ((void*)-1)\n"
+    "#define MS_ASYNC 0x1\n"
+    "#define MS_INVALIDATE 0x2\n"
+    "#define MS_SYNC 0x4\n"
+    "#define POLLIN 0x0001\n"
+    "#define POLLOUT 0x0004\n"
+    "#define POLLERR 0x0008\n"
+    "#define POLLHUP 0x0010\n"
+    "#define POLLNVAL 0x0020\n"
+    "#define WNOHANG 0x1\n"
+    "#define WUNTRACED 0x2\n"
+    "#define WCONTINUED 0x8\n"
+    "#define SIGHUP 1\n"
+    "#define SIGINT 2\n"
+    "#define SIGQUIT 3\n"
+    "#define SIGKILL 9\n"
+    "#define SIGTERM 15\n"
+    "#define SIGCHLD 17\n"
+    "#define SIGCONT 18\n"
+    "#define SIGSTOP 19\n"
+    "#define SIG_DFL 0UL\n"
+    "#define SIG_IGN 1UL\n"
+    "#define SIG_BLOCK 0\n"
+    "#define SIG_UNBLOCK 1\n"
+    "#define SIG_SETMASK 2\n"
+    "#define SA_RESTART 0x10000000UL\n"
+    "#define SA_RESTORER 0x04000000UL\n"
+    "#define SA_NODEFER 0x40000000UL\n"
+    "#define SA_RESETHAND 0x80000000UL\n"
+    "#define SA_NOCLDSTOP 0x00000001UL\n"
+    "#define SA_NOCLDWAIT 0x00000002UL\n"
+    "typedef long ssize_t;\n"
+    "typedef long off_t;\n"
+    "typedef int pid_t;\n"
+    "typedef unsigned int mode_t;\n"
+    "typedef struct { int fd; int16_t events; int16_t revents; } fu_pollfd_t;\n"
+    "typedef struct {\n"
+    "    uint32_t type;\n"
+    "    uint32_t mode;\n"
+    "    uint64_t size;\n"
+    "    uint32_t nlink;\n"
+    "    uint32_t fs_kind;\n"
+    "} fu_stat_t;\n"
+    "typedef struct {\n"
+    "    uint64_t sa_handler;\n"
+    "    uint64_t sa_flags;\n"
+    "    uint64_t sa_restorer;\n"
+    "    uint64_t sa_mask;\n"
+    "} fu_sigaction_t;\n"
+    "typedef struct { char name[32]; uint32_t type; } dirent_t;\n"
+    "long sys_write(int fd, const void *buf, unsigned long len);\n"
+    "long sys_read(int fd, void *buf, unsigned long len);\n"
+    "int sys_open(const char *path, int flags);\n"
+    "int sys_close(int fd);\n"
+    "void sys_exit(int code);\n"
+    "int sys_fork(void);\n"
+    "int sys_exec(const char *path, const char *const argv[]);\n"
+    "int sys_waitpid(int pid, int *status, int options);\n"
+    "int sys_wait(int pid, int *status);\n"
+    "int sys_getpid(void);\n"
+    "int sys_kill(int pid, int sig);\n"
+    "int sys_sigaction(int sig, const fu_sigaction_t *act, fu_sigaction_t *oldact);\n"
+    "int sys_sigprocmask(int how, unsigned long set, unsigned long *oldset);\n"
+    "int sys_sigreturn(void);\n"
+    "int sys_fcntl(int fd, int cmd, int arg);\n"
+    "int sys_poll(fu_pollfd_t *fds, int nfds, unsigned long timeout_ticks);\n"
+    "int sys_setpgid(int pid, int pgid);\n"
+    "int sys_getpgid(int pid);\n"
+    "int sys_chdir(const char *path);\n"
+    "int sys_mkdir(const char *path);\n"
+    "int sys_rmdir(const char *path);\n"
+    "int sys_unlink(const char *path);\n"
+    "int sys_getcwd(char *buf, unsigned long len);\n"
+    "int sys_rename(const char *old_path, const char *new_path);\n"
+    "int sys_chmod(const char *path, uint32_t mode);\n"
+    "int sys_dup2(int oldfd, int newfd);\n"
+    "int sys_pipe(int fds[2]);\n"
+    "int sys_sleep(unsigned long ticks);\n"
+    "long sys_lseek(int fd, long offset, int whence);\n"
+    "int sys_stat(const char *path, fu_stat_t *st);\n"
+    "int sys_lstat(const char *path, fu_stat_t *st);\n"
+    "int sys_fstat(int fd, fu_stat_t *st);\n"
+    "int sys_mount(const char *source, const char *target, const char *fstype,\n"
+    "              unsigned long flags, const void *data);\n"
+    "int sys_umount(const char *target, unsigned long flags);\n"
+    "int sys_link(const char *old_path, const char *new_path);\n"
+    "int sys_symlink(const char *target, const char *link_path);\n"
+    "int sys_readlink(const char *path, char *buf, unsigned long buflen);\n"
+    "int sys_mkfsext4(const char *target, unsigned long flags, const void *opts);\n"
+    "int sys_fsckext4(const char *target, unsigned long flags);\n"
+    "void *sys_mmap(void *addr, unsigned long len, int prot, int flags, int fd, unsigned long offset);\n"
+    "int sys_munmap(void *addr, unsigned long len);\n"
+    "int sys_mprotect(void *addr, unsigned long len, int prot);\n"
+    "int sys_fsync(int fd);\n"
+    "int sys_msync(void *addr, unsigned long len, unsigned long flags);\n"
+    "void *sys_brk(void *addr);\n"
+    "void *sys_sbrk(long increment);\n"
+    "void sys_yield(void);\n"
+    "size_t strlen(const char *s);\n"
+    "int strcmp(const char *a, const char *b);\n"
+    "int strncmp(const char *a, const char *b, size_t n);\n"
+    "char *strcpy(char *dst, const char *src);\n"
+    "char *strchr(const char *s, int c);\n"
+    "char *strrchr(const char *s, int c);\n"
+    "void *memset(void *dst, int c, size_t n);\n"
+    "void *memcpy(void *dst, const void *src, size_t n);\n"
+    "void *memmove(void *dst, const void *src, size_t n);\n"
+    "int memcmp(const void *a, const void *b, size_t n);\n"
+    "void puts(const char *s);\n"
+    "void putc(char c);\n"
+    "int putchar(int c);\n"
+    "int getchar(void);\n"
+    "int readline(char *buf, int maxlen);\n"
+    "int printf(const char *fmt, ...);\n"
+    "int vprintf(const char *fmt, va_list ap);\n"
+    "int snprintf(char *buf, size_t n, const char *fmt, ...);\n"
+    "int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);\n"
+    "void *malloc(size_t size);\n"
+    "void free(void *ptr);\n"
+    "void *realloc(void *ptr, size_t size);\n"
+    "void *calloc(size_t n, size_t size);\n"
+    "void abort(void) __attribute__((noreturn));\n"
+    "#endif\n";
+
+static const char sdk_unistd_h[] =
+    "#ifndef FUROS_SDK_UNISTD_H\n"
+    "#define FUROS_SDK_UNISTD_H\n"
+    "#include <furios.h>\n"
+    "static inline long read(int fd, void *buf, unsigned long len) { return sys_read(fd, buf, len); }\n"
+    "static inline long write(int fd, const void *buf, unsigned long len) { return sys_write(fd, buf, len); }\n"
+    "static inline int close(int fd) { return sys_close(fd); }\n"
+    "static inline int fsync(int fd) { return sys_fsync(fd); }\n"
+    "static inline int fork(void) { return sys_fork(); }\n"
+    "static inline int execv(const char *p, const char *const a[]) { return sys_exec(p, a); }\n"
+    "static inline int execve(const char *p, const char *const a[], const char *const e[]) { (void)e; return sys_exec(p, a); }\n"
+    "static inline int chdir(const char *p) { return sys_chdir(p); }\n"
+    "static inline int unlink(const char *p) { return sys_unlink(p); }\n"
+    "static inline int link(const char *o, const char *n) { return sys_link(o, n); }\n"
+    "static inline int symlink(const char *t, const char *l) { return sys_symlink(t, l); }\n"
+    "static inline int readlink(const char *p, char *b, unsigned long n) { return sys_readlink(p, b, n); }\n"
+    "static inline int mkdir(const char *p) { return sys_mkdir(p); }\n"
+    "static inline int rmdir(const char *p) { return sys_rmdir(p); }\n"
+    "static inline int getpid(void) { return sys_getpid(); }\n"
+    "static inline int pipe(int fds[2]) { return sys_pipe(fds); }\n"
+    "static inline int dup2(int oldfd, int newfd) { return sys_dup2(oldfd, newfd); }\n"
+    "static inline int sleep(unsigned long ticks) { return sys_sleep(ticks); }\n"
+    "static inline int getcwd(char *buf, unsigned long len) { return sys_getcwd(buf, len); }\n"
+    "static inline int rename(const char *a, const char *b) { return sys_rename(a, b); }\n"
+    "static inline long lseek(int fd, long off, int whence) { return sys_lseek(fd, off, whence); }\n"
+    "static inline int chmod(const char *p, uint32_t mode) { return sys_chmod(p, mode); }\n"
+    "static inline void *brk(void *addr) { return sys_brk(addr); }\n"
+    "static inline void *sbrk(long inc) { return sys_sbrk(inc); }\n"
+    "static inline void _exit(int code) { sys_exit(code); }\n"
+    "#endif\n";
+
+static const char sdk_fcntl_h[] =
+    "#ifndef FUROS_SDK_FCNTL_H\n"
+    "#define FUROS_SDK_FCNTL_H\n"
+    "#include <furios.h>\n"
+    "static inline int open(const char *path, int flags) { return sys_open(path, flags); }\n"
+    "static inline int fcntl(int fd, int cmd, int arg) { return sys_fcntl(fd, cmd, arg); }\n"
+    "#endif\n";
+
+static const char sdk_string_h[] =
+    "#ifndef FUROS_SDK_STRING_H\n"
+    "#define FUROS_SDK_STRING_H\n"
+    "#include <stddef.h>\n"
+    "size_t strlen(const char *s);\n"
+    "int strcmp(const char *a, const char *b);\n"
+    "int strncmp(const char *a, const char *b, size_t n);\n"
+    "char *strcpy(char *dst, const char *src);\n"
+    "char *strchr(const char *s, int c);\n"
+    "char *strrchr(const char *s, int c);\n"
+    "void *memset(void *dst, int c, size_t n);\n"
+    "void *memcpy(void *dst, const void *src, size_t n);\n"
+    "void *memmove(void *dst, const void *src, size_t n);\n"
+    "int memcmp(const void *a, const void *b, size_t n);\n"
+    "#endif\n";
+
+static const char sdk_stdio_h[] =
+    "#ifndef FUROS_SDK_STDIO_H\n"
+    "#define FUROS_SDK_STDIO_H\n"
+    "#include <stddef.h>\n"
+    "#include <stdarg.h>\n"
+    "void puts(const char *s);\n"
+    "void putc(char c);\n"
+    "int putchar(int c);\n"
+    "int getchar(void);\n"
+    "int readline(char *buf, int maxlen);\n"
+    "int printf(const char *fmt, ...);\n"
+    "int vprintf(const char *fmt, va_list ap);\n"
+    "int snprintf(char *buf, size_t n, const char *fmt, ...);\n"
+    "int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);\n"
+    "#endif\n";
+
+static const char sdk_stdlib_h[] =
+    "#ifndef FUROS_SDK_STDLIB_H\n"
+    "#define FUROS_SDK_STDLIB_H\n"
+    "#include <stddef.h>\n"
+    "void *malloc(size_t size);\n"
+    "void free(void *ptr);\n"
+    "void *realloc(void *ptr, size_t size);\n"
+    "void *calloc(size_t n, size_t size);\n"
+    "void exit(int code) __attribute__((noreturn));\n"
+    "void abort(void);\n"
+    "#endif\n";
+
+static const char sdk_sys_stat_h[] =
+    "#ifndef FUROS_SDK_SYS_STAT_H\n"
+    "#define FUROS_SDK_SYS_STAT_H\n"
+    "#include <furios.h>\n"
+    "typedef fu_stat_t stat_t;\n"
+    "#define S_IFMT  0170000\n"
+    "#define S_IFDIR 0040000\n"
+    "#define S_IFREG 0100000\n"
+    "#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)\n"
+    "#define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)\n"
+    "#define S_IRUSR 0400\n"
+    "#define S_IWUSR 0200\n"
+    "#define S_IXUSR 0100\n"
+    "#define S_IRGRP 0040\n"
+    "#define S_IWGRP 0020\n"
+    "#define S_IXGRP 0010\n"
+    "#define S_IROTH 0004\n"
+    "#define S_IWOTH 0002\n"
+    "#define S_IXOTH 0001\n"
+    "static inline int stat(const char *path, stat_t *st) { return sys_stat(path, st); }\n"
+    "static inline int lstat(const char *path, stat_t *st) { return sys_lstat(path, st); }\n"
+    "static inline int fstat(int fd, stat_t *st) { return sys_fstat(fd, st); }\n"
+    "#endif\n";
+
+static const char sdk_stddef_h[] =
+    "#ifndef _STDDEF_H\n"
+    "#define _STDDEF_H\n"
+    "typedef unsigned long size_t;\n"
+    "typedef long ptrdiff_t;\n"
+    "#define NULL ((void*)0)\n"
+    "#define offsetof(type, member) ((size_t)&(((type *)0)->member))\n"
+    "#endif\n";
+
+static const char sdk_stdint_h[] =
+    "#ifndef _STDINT_H\n"
+    "#define _STDINT_H\n"
+    "typedef signed char int8_t;\n"
+    "typedef unsigned char uint8_t;\n"
+    "typedef short int16_t;\n"
+    "typedef unsigned short uint16_t;\n"
+    "typedef int int32_t;\n"
+    "typedef unsigned int uint32_t;\n"
+    "typedef long long int64_t;\n"
+    "typedef unsigned long long uint64_t;\n"
+    "typedef long intptr_t;\n"
+    "typedef unsigned long uintptr_t;\n"
+    "#endif\n";
+
+static const char sdk_stdbool_h[] =
+    "#ifndef _STDBOOL_H\n"
+    "#define _STDBOOL_H\n"
+    "#define bool _Bool\n"
+    "#define true 1\n"
+    "#define false 0\n"
+    "#define __bool_true_false_are_defined 1\n"
+    "#endif\n";
+
+static const char sdk_stdarg_h[] =
+    "#ifndef _STDARG_H\n"
+    "#define _STDARG_H\n"
+    "typedef __builtin_va_list va_list;\n"
+    "#define va_start __builtin_va_start\n"
+    "#define va_arg __builtin_va_arg\n"
+    "#define va_copy __builtin_va_copy\n"
+    "#define va_end __builtin_va_end\n"
+    "typedef va_list __gnuc_va_list;\n"
+    "#define _VA_LIST_DEFINED\n"
+    "#endif\n";
+
+static const char sdk_errno_h[] =
+    "#ifndef _ERRNO_H\n"
+    "#define _ERRNO_H\n"
+    "extern int errno;\n"
+    "#define EPERM 1\n"
+    "#define ENOENT 2\n"
+    "#define ESRCH 3\n"
+    "#define EINTR 4\n"
+    "#define EIO 5\n"
+    "#define ENXIO 6\n"
+    "#define E2BIG 7\n"
+    "#define ENOEXEC 8\n"
+    "#define EBADF 9\n"
+    "#define ECHILD 10\n"
+    "#define EAGAIN 11\n"
+    "#define ENOMEM 12\n"
+    "#define EACCES 13\n"
+    "#define EFAULT 14\n"
+    "#define EBUSY 16\n"
+    "#define EEXIST 17\n"
+    "#define EXDEV 18\n"
+    "#define ENODEV 19\n"
+    "#define ENOTDIR 20\n"
+    "#define EISDIR 21\n"
+    "#define EINVAL 22\n"
+    "#define ENFILE 23\n"
+    "#define EMFILE 24\n"
+    "#define ENOTTY 25\n"
+    "#define ENOSPC 28\n"
+    "#define EPIPE 32\n"
+    "#define ENOSYS 38\n"
+    "#endif\n";
+
+static const char sdk_sys_types_h[] =
+    "#ifndef _SYS_TYPES_H\n"
+    "#define _SYS_TYPES_H\n"
+    "typedef long ssize_t;\n"
+    "typedef long off_t;\n"
+    "typedef int pid_t;\n"
+    "typedef unsigned int mode_t;\n"
+    "typedef unsigned long size_t;\n"
+    "#endif\n";
+
+static const char sdk_sys_wait_h[] =
+    "#ifndef _SYS_WAIT_H\n"
+    "#define _SYS_WAIT_H\n"
+    "#include <furios.h>\n"
+    "#define WIFEXITED(status) (((status) & 0x7f) == 0)\n"
+    "#define WEXITSTATUS(status) (((status) >> 8) & 0xff)\n"
+    "#define WIFSIGNALED(status) (((status) & 0x7f) != 0 && ((status) & 0x7f) != 0x7f)\n"
+    "#define WTERMSIG(status) ((status) & 0x7f)\n"
+    "#define WIFSTOPPED(status) (((status) & 0xff) == 0x7f)\n"
+    "#define WSTOPSIG(status) (((status) >> 8) & 0xff)\n"
+    "#define WIFCONTINUED(status) ((status) == 0xffff)\n"
+    "static inline int waitpid(int pid, int *status, int options) { return sys_waitpid(pid, status, options); }\n"
+    "static inline int wait(int *status) { return sys_wait(-1, status); }\n"
+    "#endif\n";
+
+static const char sdk_signal_h[] =
+    "#ifndef _SIGNAL_H\n"
+    "#define _SIGNAL_H\n"
+    "#include <furios.h>\n"
+    "typedef struct sigaction {\n"
+    "    unsigned long sa_handler;\n"
+    "    unsigned long sa_flags;\n"
+    "    unsigned long sa_restorer;\n"
+    "    unsigned long sa_mask;\n"
+    "} sigaction_t;\n"
+    "#define SIG_DFL 0UL\n"
+    "#define SIG_IGN 1UL\n"
+    "#define SIG_BLOCK 0\n"
+    "#define SIG_UNBLOCK 1\n"
+    "#define SIG_SETMASK 2\n"
+    "#define SA_RESTART 0x10000000UL\n"
+    "#define SA_RESTORER 0x04000000UL\n"
+    "#define SA_NODEFER 0x40000000UL\n"
+    "#define SA_RESETHAND 0x80000000UL\n"
+    "#define SA_NOCLDSTOP 0x00000001UL\n"
+    "#define SA_NOCLDWAIT 0x00000002UL\n"
+    "static inline int kill(int pid, int sig) { return sys_kill(pid, sig); }\n"
+    "static inline int sigaction(int sig, const sigaction_t *act, sigaction_t *oldact) {\n"
+    "    return sys_sigaction(sig, (const fu_sigaction_t *)act, (fu_sigaction_t *)oldact);\n"
+    "}\n"
+    "static inline int sigprocmask(int how, unsigned long set, unsigned long *oldset) {\n"
+    "    return sys_sigprocmask(how, set, oldset);\n"
+    "}\n"
+    "#endif\n";
+
+static const char sdk_poll_h[] =
+    "#ifndef _POLL_H\n"
+    "#define _POLL_H\n"
+    "#include <furios.h>\n"
+    "typedef fu_pollfd_t pollfd;\n"
+    "static inline int poll(pollfd *fds, int nfds, unsigned long timeout_ticks) {\n"
+    "    return sys_poll((fu_pollfd_t *)fds, nfds, timeout_ticks);\n"
+    "}\n"
+    "#endif\n";
+
+static const char sdk_sys_mman_h[] =
+    "#ifndef _SYS_MMAN_H\n"
+    "#define _SYS_MMAN_H\n"
+    "#include <furios.h>\n"
+    "static inline void *mmap(void *addr, unsigned long len, int prot, int flags, int fd, unsigned long offset) {\n"
+    "    return sys_mmap(addr, len, prot, flags, fd, offset);\n"
+    "}\n"
+    "static inline int munmap(void *addr, unsigned long len) { return sys_munmap(addr, len); }\n"
+    "static inline int mprotect(void *addr, unsigned long len, int prot) { return sys_mprotect(addr, len, prot); }\n"
+    "static inline int msync(void *addr, unsigned long len, unsigned long flags) {\n"
+    "    return sys_msync(addr, len, flags);\n"
+    "}\n"
+    "#endif\n";
+
+static const char sdk_limits_h[] =
+    "#ifndef _LIMITS_H\n"
+    "#define _LIMITS_H\n"
+    "#define CHAR_BIT 8\n"
+    "#define SCHAR_MIN (-128)\n"
+    "#define SCHAR_MAX 127\n"
+    "#define UCHAR_MAX 255\n"
+    "#define SHRT_MIN (-32768)\n"
+    "#define SHRT_MAX 32767\n"
+    "#define USHRT_MAX 65535\n"
+    "#define INT_MIN (-2147483647 - 1)\n"
+    "#define INT_MAX 2147483647\n"
+    "#define UINT_MAX 4294967295U\n"
+    "#define LONG_MIN (-9223372036854775807L - 1)\n"
+    "#define LONG_MAX 9223372036854775807L\n"
+    "#define ULONG_MAX 18446744073709551615UL\n"
+    "#endif\n";
+
+static const char sdk_assert_h[] =
+    "#ifndef _ASSERT_H\n"
+    "#define _ASSERT_H\n"
+    "void __assert_fail(const char *assertion, const char *file, unsigned int line, const char *function);\n"
+    "#ifndef NDEBUG\n"
+    "#define assert(expr) ((expr) ? (void)0 : __assert_fail(#expr, __FILE__, __LINE__, __func__))\n"
+    "#else\n"
+    "#define assert(expr) ((void)0)\n"
+    "#endif\n"
+    "#endif\n";
+
+static const char sdk_inttypes_h[] =
+    "#ifndef _INTTYPES_H\n"
+    "#define _INTTYPES_H\n"
+    "#include <stdint.h>\n"
+    "#define PRIu64 \"llu\"\n"
+    "#define PRIx64 \"llx\"\n"
+    "#define PRId64 \"lld\"\n"
+    "#endif\n";
+
+static const char sdk_time_h[] =
+    "#ifndef _TIME_H\n"
+    "#define _TIME_H\n"
+    "typedef long time_t;\n"
+    "int sleep(unsigned long ticks);\n"
+    "#endif\n";
 
 static uint32_t rd_le32(const uint8_t *p) {
     return (uint32_t)p[0] |
@@ -132,6 +623,9 @@ static inode_t *inode_alloc(const char *name, inode_type_t type) {
 static void inode_free(inode_t *ino) {
     if (!ino) {
         return;
+    }
+    if (ino->type == INODE_FILE) {
+        pagecache_invalidate_inode(ino);
     }
     memset(ino, 0, sizeof(*ino));
 }
@@ -233,97 +727,80 @@ static int sata_index_for_kind(dev_kind_t kind) {
     return (int)(kind - DEV_SDA);
 }
 
-static int nvme_index_for_kind(dev_kind_t kind) {
-    if (kind < DEV_NVME0N1 || kind > DEV_NVME7N1) {
-        return -1;
+static bool nvme_kind_decode(dev_kind_t kind, uint32_t *ctrl_out, uint32_t *nsid_out) {
+    if (kind < DEV_NVME_BASE || kind > DEV_NVME_LAST) {
+        return false;
     }
-    return (int)(kind - DEV_NVME0N1);
+    uint32_t idx = (uint32_t)(kind - DEV_NVME_BASE);
+    uint32_t ctrl = idx / NVME_MAX_NAMESPACES;
+    uint32_t nsid = (idx % NVME_MAX_NAMESPACES) + 1U;
+    if (ctrl >= NVME_MAX_CONTROLLERS || nsid == 0U || nsid > NVME_MAX_NAMESPACES) {
+        return false;
+    }
+    if (ctrl_out) {
+        *ctrl_out = ctrl;
+    }
+    if (nsid_out) {
+        *nsid_out = nsid;
+    }
+    return true;
+}
+
+static dev_kind_t nvme_kind_encode(uint32_t ctrl, uint32_t nsid) {
+    if (ctrl >= NVME_MAX_CONTROLLERS || nsid == 0U || nsid > NVME_MAX_NAMESPACES) {
+        return DEV_NONE;
+    }
+    return (dev_kind_t)(DEV_NVME_BASE + (dev_kind_t)(ctrl * NVME_MAX_NAMESPACES + (nsid - 1U)));
 }
 
 static bool dev_kind_is_block(dev_kind_t kind) {
-    return kind == DEV_VDA || sata_index_for_kind(kind) >= 0 || nvme_index_for_kind(kind) >= 0;
+    return kind == DEV_VDA || sata_index_for_kind(kind) >= 0 || nvme_kind_decode(kind, 0, 0);
 }
 
 static bool dev_block_ready_kind(dev_kind_t kind) {
     int sidx = sata_index_for_kind(kind);
-    int nidx = nvme_index_for_kind(kind);
+    uint32_t nctrl = 0U;
+    uint32_t nsid = 0U;
     if (kind == DEV_VDA) {
         return virtio_blk_ready();
     }
     if (sidx >= 0) {
         return ahci_disk_present((uint32_t)sidx);
     }
-    if (nidx >= 0) {
-        return nvme_disk_present((uint32_t)nidx);
+    if (nvme_kind_decode(kind, &nctrl, &nsid)) {
+        return nvme_ns_present(nctrl, nsid);
     }
     return false;
 }
 
 static uint64_t dev_block_capacity_sectors(dev_kind_t kind) {
     int sidx = sata_index_for_kind(kind);
-    int nidx = nvme_index_for_kind(kind);
+    uint32_t nctrl = 0U;
+    uint32_t nsid = 0U;
     if (kind == DEV_VDA) {
         return virtio_blk_capacity_sectors();
     }
     if (sidx >= 0) {
         return ahci_disk_capacity_sectors((uint32_t)sidx);
     }
-    if (nidx >= 0) {
-        return nvme_disk_capacity_sectors((uint32_t)nidx);
+    if (nvme_kind_decode(kind, &nctrl, &nsid)) {
+        return nvme_ns_capacity_sectors512(nctrl, nsid);
     }
     return 0U;
 }
 
 static int dev_block_rw_sector(dev_kind_t kind, uint64_t lba, void *buf, bool write) {
     int sidx = sata_index_for_kind(kind);
-    int nidx = nvme_index_for_kind(kind);
+    uint32_t nctrl = 0U;
+    uint32_t nsid = 0U;
     if (kind == DEV_VDA) {
         return virtio_blk_rw_sector(lba, buf, write);
     }
     if (sidx >= 0) {
         return ahci_rw_sector((uint32_t)sidx, lba, buf, write);
     }
-    if (nidx >= 0) {
-        return nvme_rw_sector((uint32_t)nidx, lba, buf, write);
-    }
-    return -1;
-}
-
-static int dev_block_rw(dev_kind_t kind, uint64_t lba, void *buf, uint32_t count, bool write) {
-    int sidx = sata_index_for_kind(kind);
-    int nidx = nvme_index_for_kind(kind);
-    if (count == 0U) {
-        return 0;
-    }
-    if (kind == DEV_VDA) {
-        uint8_t *p = (uint8_t *)buf;
-        for (uint32_t i = 0; i < count; i++) {
-            if (virtio_blk_rw_sector(lba + i, p + (uint64_t)i * VIRTIO_BLK_SECTOR_SIZE, write) != 0) {
-                return -1;
-            }
-        }
-        return 0;
-    }
-    if (sidx >= 0) {
-        return ahci_rw((uint32_t)sidx, lba, buf, count, write);
-    }
-    if (nidx >= 0) {
-        return nvme_rw((uint32_t)nidx, lba, buf, count, write);
-    }
-    return -1;
-}
-
-static int dev_block_flush_kind(dev_kind_t kind) {
-    int sidx = sata_index_for_kind(kind);
-    int nidx = nvme_index_for_kind(kind);
-    if (kind == DEV_VDA) {
-        return virtio_blk_flush();
-    }
-    if (sidx >= 0) {
-        return ahci_flush((uint32_t)sidx);
-    }
-    if (nidx >= 0) {
-        return nvme_flush((uint32_t)nidx);
+    if (nvme_kind_decode(kind, &nctrl, &nsid)) {
+        return nvme_ns_rw_sector(nctrl, nsid, lba, buf, write);
     }
     return -1;
 }
@@ -419,6 +896,51 @@ static inode_t *mk_file(inode_t *parent, const char *name, const uint8_t *data,
     return f;
 }
 
+static bool memfs_ensure_capacity(inode_t *inode, size_t need) {
+    const size_t max_cap = 16U * 1024U * 1024U;
+    if (!inode || inode->fs_kind != FS_KIND_MEM || inode->type != INODE_FILE ||
+        !inode->writable || !inode->data) {
+        return false;
+    }
+    if (need <= inode->capacity) {
+        return true;
+    }
+    if (need > max_cap) {
+        return false;
+    }
+
+    size_t cap = inode->capacity ? inode->capacity : FILE_CAPACITY;
+    while (cap < need) {
+        if (cap >= max_cap / 2U) {
+            cap = max_cap;
+            break;
+        }
+        cap *= 2U;
+    }
+    if (cap < need || cap > max_cap) {
+        return false;
+    }
+
+    uint8_t *new_data = (uint8_t *)pmm_alloc(cap, 16);
+    if (!new_data) {
+        return false;
+    }
+    memset(new_data, 0, cap);
+    if (inode->size) {
+        memcpy(new_data, inode->data, inode->size);
+    }
+    inode->data = new_data;
+    inode->capacity = cap;
+    return true;
+}
+
+static inode_t *mk_text_file(inode_t *parent, const char *name, const char *text, bool writable) {
+    if (!text) {
+        return 0;
+    }
+    return mk_file(parent, name, (const uint8_t *)text, strlen(text), false, writable);
+}
+
 static inode_t *mk_dev(inode_t *parent, const char *name, dev_kind_t kind, bool writable) {
     inode_t *d = inode_alloc(name, INODE_DEV);
     if (!d) {
@@ -482,122 +1004,6 @@ static inode_t *mk_dev_part(inode_t *parent, dev_kind_t base_kind, const char *n
     return d;
 }
 
-static int dev_block_read_inode(const inode_t *inode, size_t *offset, void *buf, size_t len) {
-    dev_kind_t kind;
-    uint64_t base_lba;
-    uint64_t lba_count;
-    if (!inode || !offset || !buf || inode->type != INODE_DEV) {
-        return -1;
-    }
-    kind = inode->dev_kind;
-    if (!dev_block_ready_kind(kind)) {
-        return -1;
-    }
-    base_lba = inode->dev_lba_start;
-    lba_count = inode->dev_lba_count ? inode->dev_lba_count : dev_block_capacity_sectors(kind);
-    uint64_t cap = lba_count * (uint64_t)VIRTIO_BLK_SECTOR_SIZE;
-    if ((uint64_t)(*offset) >= cap) {
-        return 0;
-    }
-    size_t todo = len;
-    if ((uint64_t)(*offset) + todo > cap) {
-        todo = (size_t)(cap - (uint64_t)(*offset));
-    }
-
-    uint8_t sec[VIRTIO_BLK_SECTOR_SIZE];
-    size_t done = 0;
-    while (done < todo) {
-        uint64_t off = (uint64_t)(*offset) + done;
-        uint64_t lba = off / VIRTIO_BLK_SECTOR_SIZE;
-        size_t sec_off = (size_t)(off % VIRTIO_BLK_SECTOR_SIZE);
-        size_t chunk = VIRTIO_BLK_SECTOR_SIZE - sec_off;
-        if (chunk > todo - done) {
-            chunk = todo - done;
-        }
-        if (sec_off == 0U && chunk == VIRTIO_BLK_SECTOR_SIZE) {
-            uint32_t nsec = (uint32_t)((todo - done) / VIRTIO_BLK_SECTOR_SIZE);
-            if (nsec > 128U) {
-                nsec = 128U;
-            }
-            if (nsec > 0U && dev_block_rw(kind, base_lba + lba,
-                                          (uint8_t *)buf + done, nsec, false) == 0) {
-                done += (size_t)nsec * VIRTIO_BLK_SECTOR_SIZE;
-                continue;
-            }
-        }
-        if (dev_block_rw_sector(kind, base_lba + lba, sec, false) != 0) {
-            return done ? (int)done : -1;
-        }
-        memcpy((uint8_t *)buf + done, sec + sec_off, chunk);
-        done += chunk;
-    }
-    *offset += done;
-    return (int)done;
-}
-
-static int dev_block_write_inode(const inode_t *inode, size_t *offset, const void *buf, size_t len) {
-    dev_kind_t kind;
-    uint64_t base_lba;
-    uint64_t lba_count;
-    if (!inode || !offset || !buf || inode->type != INODE_DEV) {
-        return -1;
-    }
-    kind = inode->dev_kind;
-    if (!dev_block_ready_kind(kind)) {
-        return -1;
-    }
-    base_lba = inode->dev_lba_start;
-    lba_count = inode->dev_lba_count ? inode->dev_lba_count : dev_block_capacity_sectors(kind);
-    uint64_t cap = lba_count * (uint64_t)VIRTIO_BLK_SECTOR_SIZE;
-    if ((uint64_t)(*offset) >= cap) {
-        return -1;
-    }
-    size_t todo = len;
-    if ((uint64_t)(*offset) + todo > cap) {
-        todo = (size_t)(cap - (uint64_t)(*offset));
-    }
-
-    uint8_t sec[VIRTIO_BLK_SECTOR_SIZE];
-    size_t done = 0;
-    while (done < todo) {
-        uint64_t off = (uint64_t)(*offset) + done;
-        uint64_t lba = off / VIRTIO_BLK_SECTOR_SIZE;
-        size_t sec_off = (size_t)(off % VIRTIO_BLK_SECTOR_SIZE);
-        size_t chunk = VIRTIO_BLK_SECTOR_SIZE - sec_off;
-        if (chunk > todo - done) {
-            chunk = todo - done;
-        }
-
-        if (sec_off == 0U && chunk == VIRTIO_BLK_SECTOR_SIZE) {
-            uint32_t nsec = (uint32_t)((todo - done) / VIRTIO_BLK_SECTOR_SIZE);
-            if (nsec > 128U) {
-                nsec = 128U;
-            }
-            if (nsec > 0U && dev_block_rw(kind, base_lba + lba,
-                                          (void *)((const uint8_t *)buf + done), nsec, true) == 0) {
-                done += (size_t)nsec * VIRTIO_BLK_SECTOR_SIZE;
-                continue;
-            }
-        }
-
-        if (chunk != VIRTIO_BLK_SECTOR_SIZE || sec_off != 0U) {
-            if (dev_block_rw_sector(kind, base_lba + lba, sec, false) != 0) {
-                return done ? (int)done : -1;
-            }
-        }
-        memcpy(sec + sec_off, (const uint8_t *)buf + done, chunk);
-        if (dev_block_rw_sector(kind, base_lba + lba, sec, true) != 0) {
-            return done ? (int)done : -1;
-        }
-        done += chunk;
-    }
-    *offset += done;
-    if (done > 0U) {
-        (void)dev_block_flush_kind(kind);
-    }
-    return (int)done;
-}
-
 static size_t blob_size(uint8_t *start, uint8_t *end) {
     return (size_t)(end - start);
 }
@@ -658,26 +1064,30 @@ static bool make_part_name(const char *base, uint32_t pnum, char *out, size_t ou
     return true;
 }
 
-static bool make_nvme_name(uint32_t idx, char *out, size_t outsz) {
-    char num[12];
+static bool make_nvme_name(uint32_t ctrl, uint32_t nsid, char *out, size_t outsz) {
+    char cnum[12];
+    char nnum[12];
+    int clen;
     int nlen;
     size_t pos = 0U;
-    if (!out || outsz == 0U) {
+    if (!out || outsz == 0U || nsid == 0U) {
         return false;
     }
-    nlen = u32_to_dec(idx, num, sizeof(num));
-    if (nlen <= 0) {
+    clen = u32_to_dec(ctrl, cnum, sizeof(cnum));
+    nlen = u32_to_dec(nsid, nnum, sizeof(nnum));
+    if (clen <= 0 || nlen <= 0) {
         return false;
     }
-    if ((size_t)nlen + 7U + 1U > outsz) {
+    if (4U + (size_t)clen + 1U + (size_t)nlen + 1U > outsz) {
         return false;
     }
     memcpy(out + pos, "nvme", 4U);
     pos += 4U;
-    memcpy(out + pos, num, (size_t)nlen);
-    pos += (size_t)nlen;
+    memcpy(out + pos, cnum, (size_t)clen);
+    pos += (size_t)clen;
     out[pos++] = 'n';
-    out[pos++] = '1';
+    memcpy(out + pos, nnum, (size_t)nlen);
+    pos += (size_t)nlen;
     out[pos] = '\0';
     return true;
 }
@@ -837,46 +1247,48 @@ static void fs_sync_hotplug_block_devs(void) {
         }
     }
 
-    uint32_t nvme_cnt = nvme_disk_count();
-    if (nvme_cnt > (uint32_t)NVME_DEV_MAX) {
-        nvme_cnt = (uint32_t)NVME_DEV_MAX;
+    uint32_t nctrls = nvme_controller_count();
+    if (nctrls > NVME_MAX_CONTROLLERS) {
+        nctrls = NVME_MAX_CONTROLLERS;
     }
-    for (uint32_t i = 0; i < nvme_cnt; i++) {
-        char name[INODE_NAME_MAX + 1];
-        inode_t *n;
-        dev_kind_t k = (dev_kind_t)(DEV_NVME0N1 + i);
-        size_t base_len;
-        if (!make_nvme_name(i, name, sizeof(name))) {
-            continue;
-        }
-        base_len = strlen(name);
-
-        if (!nvme_disk_present(i)) {
-            if (mount_uses_source_dev(k)) {
+    for (uint32_t ctrl = 0; ctrl < nctrls; ctrl++) {
+        for (uint32_t nsid = 1U; nsid <= NVME_MAX_NAMESPACES; nsid++) {
+            char name[INODE_NAME_MAX + 1];
+            inode_t *n;
+            dev_kind_t k = nvme_kind_encode(ctrl, nsid);
+            size_t base_len;
+            if (k == DEV_NONE || !make_nvme_name(ctrl, nsid, name, sizeof(name))) {
                 continue;
             }
-            for (uint32_t j = 0; j < dev_root_inode->child_count;) {
-                inode_t *c = dev_root_inode->children[j];
-                if (c && strncmp(c->name, name, base_len) == 0 &&
-                    (c->name[base_len] == '\0' ||
-                     (c->name[base_len] == 'p' && c->name[base_len + 1U] >= '1' &&
-                      c->name[base_len + 1U] <= '9'))) {
-                    if (dir_remove_child(dev_root_inode, c)) {
-                        inode_free(c);
-                        continue;
-                    }
-                }
-                j++;
-            }
-            continue;
-        }
-        if (dir_find_child(dev_root_inode, name)) {
-            continue;
-        }
+            base_len = strlen(name);
 
-        n = mk_dev(dev_root_inode, name, k, true);
-        if (n) {
-            probe_partitions(dev_root_inode, k, name);
+            if (!nvme_ns_present(ctrl, nsid)) {
+                if (mount_uses_source_dev(k)) {
+                    continue;
+                }
+                for (uint32_t j = 0; j < dev_root_inode->child_count;) {
+                    inode_t *c = dev_root_inode->children[j];
+                    if (c && strncmp(c->name, name, base_len) == 0 &&
+                        (c->name[base_len] == '\0' ||
+                         (c->name[base_len] == 'p' && c->name[base_len + 1U] >= '1' &&
+                          c->name[base_len + 1U] <= '9'))) {
+                        if (dir_remove_child(dev_root_inode, c)) {
+                            inode_free(c);
+                            continue;
+                        }
+                    }
+                    j++;
+                }
+                continue;
+            }
+            if (dir_find_child(dev_root_inode, name)) {
+                continue;
+            }
+
+            n = mk_dev(dev_root_inode, name, k, true);
+            if (n) {
+                probe_partitions(dev_root_inode, k, name);
+            }
         }
     }
 }
@@ -889,9 +1301,15 @@ void fs_init(void) {
 
     inode_t *bin = mk_dir(root_inode, "bin");
     inode_t *sbin = mk_dir(root_inode, "sbin");
+    inode_t *lib = mk_dir(root_inode, "lib");
+    inode_t *usr = mk_dir(root_inode, "usr");
     inode_t *etc = mk_dir(root_inode, "etc");
     inode_t *dev = mk_dir(root_inode, "dev");
+    inode_t *compat_include = mk_dir(root_inode, "include");
     (void)mk_dir(root_inode, "mnt");
+    inode_t *usr_include = usr ? mk_dir(usr, "include") : 0;
+    inode_t *usr_include_sys = usr_include ? mk_dir(usr_include, "sys") : 0;
+    inode_t *usr_lib = usr ? mk_dir(usr, "lib") : 0;
 
     mk_file(bin, "init", _binary_build_user_init_elf_start,
             blob_size(_binary_build_user_init_elf_start, _binary_build_user_init_elf_end),
@@ -910,6 +1328,12 @@ void fs_init(void) {
             true, false);
     mk_file(bin, "clear", _binary_build_user_clear_elf_start,
             blob_size(_binary_build_user_clear_elf_start, _binary_build_user_clear_elf_end),
+            true, false);
+    mk_file(bin, "nano", _binary_build_user_nano_elf_start,
+            blob_size(_binary_build_user_nano_elf_start, _binary_build_user_nano_elf_end),
+            true, false);
+    mk_file(bin, "elfinfo", _binary_build_user_elfinfo_elf_start,
+            blob_size(_binary_build_user_elfinfo_elf_start, _binary_build_user_elfinfo_elf_end),
             true, false);
     mk_file(bin, "mkdir", _binary_build_user_mkdir_elf_start,
             blob_size(_binary_build_user_mkdir_elf_start, _binary_build_user_mkdir_elf_end),
@@ -947,6 +1371,21 @@ void fs_init(void) {
     mk_file(bin, "ln", _binary_build_user_ln_elf_start,
             blob_size(_binary_build_user_ln_elf_start, _binary_build_user_ln_elf_end),
             true, false);
+    mk_file(bin, "chmod", _binary_build_user_chmod_elf_start,
+            blob_size(_binary_build_user_chmod_elf_start, _binary_build_user_chmod_elf_end),
+            true, false);
+    mk_file(bin, "tcc", _binary_build_user_tcc_elf_start,
+            blob_size(_binary_build_user_tcc_elf_start, _binary_build_user_tcc_elf_end),
+            true, false);
+    mk_file(bin, "ar", _binary_build_user_ar_elf_start,
+            blob_size(_binary_build_user_ar_elf_start, _binary_build_user_ar_elf_end),
+            true, false);
+    mk_file(bin, "ranlib", _binary_build_user_ranlib_elf_start,
+            blob_size(_binary_build_user_ranlib_elf_start, _binary_build_user_ranlib_elf_end),
+            true, false);
+    mk_file(bin, "as", _binary_build_user_as_elf_start,
+            blob_size(_binary_build_user_as_elf_start, _binary_build_user_as_elf_end),
+            true, false);
     if (sbin) {
         mk_file(sbin, "mkfs.ext4", _binary_build_user_mkfs_ext4_elf_start,
                 blob_size(_binary_build_user_mkfs_ext4_elf_start, _binary_build_user_mkfs_ext4_elf_end),
@@ -954,6 +1393,114 @@ void fs_init(void) {
         mk_file(sbin, "fsck.ext4", _binary_build_user_fsck_ext4_elf_start,
                 blob_size(_binary_build_user_fsck_ext4_elf_start, _binary_build_user_fsck_ext4_elf_end),
                 true, false);
+    }
+    if (lib) {
+        mk_file(lib, "ld-furios.so", _binary_build_user_ld_furios_elf_start,
+                blob_size(_binary_build_user_ld_furios_elf_start, _binary_build_user_ld_furios_elf_end),
+                true, false);
+        mk_file(lib, "crt1.o", _binary_build_tccrt_crt1_o_start,
+                blob_size(_binary_build_tccrt_crt1_o_start, _binary_build_tccrt_crt1_o_end),
+                false, false);
+        mk_file(lib, "crti.o", _binary_build_tccrt_crti_o_start,
+                blob_size(_binary_build_tccrt_crti_o_start, _binary_build_tccrt_crti_o_end),
+                false, false);
+        mk_file(lib, "crtn.o", _binary_build_tccrt_crtn_o_start,
+                blob_size(_binary_build_tccrt_crtn_o_start, _binary_build_tccrt_crtn_o_end),
+                false, false);
+        mk_file(lib, "crtbegin.o", _binary_build_tccrt_crtbegin_o_start,
+                blob_size(_binary_build_tccrt_crtbegin_o_start, _binary_build_tccrt_crtbegin_o_end),
+                false, false);
+        mk_file(lib, "crtend.o", _binary_build_tccrt_crtend_o_start,
+                blob_size(_binary_build_tccrt_crtend_o_start, _binary_build_tccrt_crtend_o_end),
+                false, false);
+        mk_file(lib, "libc.a", _binary_build_tccrt_libc_a_start,
+                blob_size(_binary_build_tccrt_libc_a_start, _binary_build_tccrt_libc_a_end),
+                false, false);
+        mk_file(lib, "libtcc1.a", _binary_build_tccrt_libtcc1_a_start,
+                blob_size(_binary_build_tccrt_libtcc1_a_start, _binary_build_tccrt_libtcc1_a_end),
+                false, false);
+    }
+    if (usr_lib) {
+        mk_file(usr_lib, "crt1.o", _binary_build_tccrt_crt1_o_start,
+                blob_size(_binary_build_tccrt_crt1_o_start, _binary_build_tccrt_crt1_o_end),
+                false, false);
+        mk_file(usr_lib, "crti.o", _binary_build_tccrt_crti_o_start,
+                blob_size(_binary_build_tccrt_crti_o_start, _binary_build_tccrt_crti_o_end),
+                false, false);
+        mk_file(usr_lib, "crtn.o", _binary_build_tccrt_crtn_o_start,
+                blob_size(_binary_build_tccrt_crtn_o_start, _binary_build_tccrt_crtn_o_end),
+                false, false);
+        mk_file(usr_lib, "crtbegin.o", _binary_build_tccrt_crtbegin_o_start,
+                blob_size(_binary_build_tccrt_crtbegin_o_start, _binary_build_tccrt_crtbegin_o_end),
+                false, false);
+        mk_file(usr_lib, "crtend.o", _binary_build_tccrt_crtend_o_start,
+                blob_size(_binary_build_tccrt_crtend_o_start, _binary_build_tccrt_crtend_o_end),
+                false, false);
+        mk_file(usr_lib, "libc.a", _binary_build_tccrt_libc_a_start,
+                blob_size(_binary_build_tccrt_libc_a_start, _binary_build_tccrt_libc_a_end),
+                false, false);
+        mk_file(usr_lib, "libtcc1.a", _binary_build_tccrt_libtcc1_a_start,
+                blob_size(_binary_build_tccrt_libtcc1_a_start, _binary_build_tccrt_libtcc1_a_end),
+                false, false);
+    }
+    if (usr_include) {
+        (void)mk_text_file(usr_include, "stddef.h", sdk_stddef_h, false);
+        (void)mk_text_file(usr_include, "stdint.h", sdk_stdint_h, false);
+        (void)mk_text_file(usr_include, "stdbool.h", sdk_stdbool_h, false);
+        (void)mk_file(usr_include, "tccdefs.h", _binary_third_party_tinycc_include_tccdefs_h_start,
+                      blob_size(_binary_third_party_tinycc_include_tccdefs_h_start,
+                                _binary_third_party_tinycc_include_tccdefs_h_end),
+                      false, false);
+        (void)mk_text_file(usr_include, "stdarg.h", sdk_stdarg_h, false);
+        (void)mk_text_file(usr_include, "errno.h", sdk_errno_h, false);
+        (void)mk_text_file(usr_include, "poll.h", sdk_poll_h, false);
+        (void)mk_text_file(usr_include, "signal.h", sdk_signal_h, false);
+        (void)mk_text_file(usr_include, "limits.h", sdk_limits_h, false);
+        (void)mk_text_file(usr_include, "assert.h", sdk_assert_h, false);
+        (void)mk_text_file(usr_include, "inttypes.h", sdk_inttypes_h, false);
+        (void)mk_text_file(usr_include, "time.h", sdk_time_h, false);
+        (void)mk_text_file(usr_include, "furios.h", sdk_furios_h, false);
+        (void)mk_text_file(usr_include, "unistd.h", sdk_unistd_h, false);
+        (void)mk_text_file(usr_include, "fcntl.h", sdk_fcntl_h, false);
+        (void)mk_text_file(usr_include, "string.h", sdk_string_h, false);
+        (void)mk_text_file(usr_include, "stdio.h", sdk_stdio_h, false);
+        (void)mk_text_file(usr_include, "stdlib.h", sdk_stdlib_h, false);
+    }
+    if (usr_include_sys) {
+        (void)mk_text_file(usr_include_sys, "stat.h", sdk_sys_stat_h, false);
+        (void)mk_text_file(usr_include_sys, "types.h", sdk_sys_types_h, false);
+        (void)mk_text_file(usr_include_sys, "wait.h", sdk_sys_wait_h, false);
+        (void)mk_text_file(usr_include_sys, "mman.h", sdk_sys_mman_h, false);
+    }
+    if (compat_include) {
+        (void)mk_text_file(compat_include, "stddef.h", sdk_stddef_h, false);
+        (void)mk_text_file(compat_include, "stdint.h", sdk_stdint_h, false);
+        (void)mk_text_file(compat_include, "stdbool.h", sdk_stdbool_h, false);
+        (void)mk_file(compat_include, "tccdefs.h", _binary_third_party_tinycc_include_tccdefs_h_start,
+                      blob_size(_binary_third_party_tinycc_include_tccdefs_h_start,
+                                _binary_third_party_tinycc_include_tccdefs_h_end),
+                      false, false);
+        (void)mk_text_file(compat_include, "stdarg.h", sdk_stdarg_h, false);
+        (void)mk_text_file(compat_include, "errno.h", sdk_errno_h, false);
+        (void)mk_text_file(compat_include, "poll.h", sdk_poll_h, false);
+        (void)mk_text_file(compat_include, "signal.h", sdk_signal_h, false);
+        (void)mk_text_file(compat_include, "limits.h", sdk_limits_h, false);
+        (void)mk_text_file(compat_include, "assert.h", sdk_assert_h, false);
+        (void)mk_text_file(compat_include, "inttypes.h", sdk_inttypes_h, false);
+        (void)mk_text_file(compat_include, "time.h", sdk_time_h, false);
+        (void)mk_text_file(compat_include, "furios.h", sdk_furios_h, false);
+        (void)mk_text_file(compat_include, "unistd.h", sdk_unistd_h, false);
+        (void)mk_text_file(compat_include, "fcntl.h", sdk_fcntl_h, false);
+        (void)mk_text_file(compat_include, "string.h", sdk_string_h, false);
+        (void)mk_text_file(compat_include, "stdio.h", sdk_stdio_h, false);
+        (void)mk_text_file(compat_include, "stdlib.h", sdk_stdlib_h, false);
+        inode_t *compat_sys = mk_dir(compat_include, "sys");
+        if (compat_sys) {
+            (void)mk_text_file(compat_sys, "stat.h", sdk_sys_stat_h, false);
+            (void)mk_text_file(compat_sys, "types.h", sdk_sys_types_h, false);
+            (void)mk_text_file(compat_sys, "wait.h", sdk_sys_wait_h, false);
+            (void)mk_text_file(compat_sys, "mman.h", sdk_sys_mman_h, false);
+        }
     }
 
     inode_t *motd = mk_file(etc, "motd", 0, 0, false, true);
@@ -990,18 +1537,22 @@ void fs_init(void) {
                 probe_partitions(dev, (dev_kind_t)(DEV_SDA + i), name);
             }
         }
-        uint32_t nvme_cnt = nvme_disk_count();
-        if (nvme_cnt > (uint32_t)NVME_DEV_MAX) {
-            nvme_cnt = (uint32_t)NVME_DEV_MAX;
+        uint32_t nctrls = nvme_controller_count();
+        if (nctrls > NVME_MAX_CONTROLLERS) {
+            nctrls = NVME_MAX_CONTROLLERS;
         }
-        for (uint32_t i = 0; i < nvme_cnt; i++) {
-            char name[INODE_NAME_MAX + 1];
-            if (!nvme_disk_present(i) || !make_nvme_name(i, name, sizeof(name))) {
-                continue;
-            }
-            n = mk_dev(dev, name, (dev_kind_t)(DEV_NVME0N1 + i), true);
-            if (n) {
-                probe_partitions(dev, (dev_kind_t)(DEV_NVME0N1 + i), name);
+        for (uint32_t ctrl = 0; ctrl < nctrls; ctrl++) {
+            for (uint32_t nsid = 1U; nsid <= NVME_MAX_NAMESPACES; nsid++) {
+                char name[INODE_NAME_MAX + 1];
+                dev_kind_t kind = nvme_kind_encode(ctrl, nsid);
+                if (kind == DEV_NONE || !nvme_ns_present(ctrl, nsid) ||
+                    !make_nvme_name(ctrl, nsid, name, sizeof(name))) {
+                    continue;
+                }
+                n = mk_dev(dev, name, kind, true);
+                if (n) {
+                    probe_partitions(dev, kind, name);
+                }
             }
         }
     }
@@ -1064,6 +1615,10 @@ bool fs_is_tty(const inode_t *inode) {
     return inode && inode->type == INODE_DEV && inode->dev_kind == DEV_TTY;
 }
 
+bool fs_is_block_dev(const inode_t *inode) {
+    return inode && inode->type == INODE_DEV && dev_kind_is_block(inode->dev_kind);
+}
+
 static uint32_t fs_mode_from_inode(const inode_t *inode) {
     uint32_t perms = 0;
     if (!inode) {
@@ -1102,6 +1657,10 @@ static int fs_fill_stat(inode_t *inode, fu_stat_t *st) {
     return 0;
 }
 
+int fs_stat_inode(inode_t *inode, fu_stat_t *st) {
+    return fs_fill_stat(inode, st);
+}
+
 #define MKFS_EXT4_BLOCK_SIZE             4096U
 #define MKFS_EXT4_SECTORS_PER_BLOCK      (MKFS_EXT4_BLOCK_SIZE / VIRTIO_BLK_SECTOR_SIZE)
 #define MKFS_EXT4_BLOCKS_PER_GROUP_MAX   (MKFS_EXT4_BLOCK_SIZE * 8U)
@@ -1109,6 +1668,7 @@ static int fs_fill_stat(inode_t *inode, fu_stat_t *st) {
 #define MKFS_EXT4_DEFAULT_BYTES_PER_INODE 16384U
 #define MKFS_EXT4_SMALL_BYTES_PER_INODE  4096U
 #define MKFS_EXT4_LARGEFILE_BYTES_PER_INODE 1048576U
+#define MKFS_EXT4_LARGEFILE4_BYTES_PER_INODE 4194304U
 #define MKFS_EXT4_INODE_SIZE             128U
 #define MKFS_EXT4_FIRST_INO              11U
 #define MKFS_EXT4_JOURNAL_INO            8U
@@ -1369,6 +1929,8 @@ static uint32_t mkfs_profile_bytes_per_inode(uint16_t profile) {
             return MKFS_EXT4_SMALL_BYTES_PER_INODE;
         case MKFS_EXT4_PROFILE_LARGEFILE:
             return MKFS_EXT4_LARGEFILE_BYTES_PER_INODE;
+        case MKFS_EXT4_PROFILE_LARGEFILE4:
+            return MKFS_EXT4_LARGEFILE4_BYTES_PER_INODE;
         default:
             return MKFS_EXT4_DEFAULT_BYTES_PER_INODE;
     }
@@ -1408,7 +1970,14 @@ static bool fsck_dynamic_bit_is_set(const uint8_t *bitmap, uint64_t bit) {
     return (bitmap[bit >> 3] & (uint8_t)(1U << (bit & 7U))) != 0U;
 }
 
+enum {
+    FSCK_REPAIR_NONE = 0U,
+    FSCK_REPAIR_SAFE = 1U,
+    FSCK_REPAIR_FORCE = 2U,
+};
+
 typedef struct {
+    uint32_t repair_mode;
     uint32_t inodes_count;
     uint64_t blocks_count;
     uint32_t block_size;
@@ -1424,6 +1993,7 @@ typedef struct {
     uint32_t *inode_links_refs;
     uint32_t *inode_parent;
     uint8_t *inode_dot_flags;
+    uint8_t *inode_needs_data_clear;
 } fsck_state_t;
 
 typedef struct {
@@ -1497,8 +2067,31 @@ static bool fsck_write_inode_links(uint32_t ino, uint16_t links,
     return block_cache_write((uint64_t)inode_blk * sectors_per_block, blk, sectors_per_block) == 0;
 }
 
+static bool fsck_clear_inode_payload(uint8_t *raw, uint32_t inode_size) {
+    if (!raw || inode_size < (MKFS_EXT4_INODE_BLOCK + 60U)) {
+        return false;
+    }
+    uint32_t flags = rd_le32(raw + MKFS_EXT4_INODE_FLAGS);
+    memset(raw + MKFS_EXT4_INODE_BLOCK, 0, 60U);
+    if ((flags & MKFS_EXT4_EXTENTS_FL) != 0U) {
+        wr_le16(raw + MKFS_EXT4_INODE_BLOCK + MKFS_EXT4_EXT_HDR_MAGIC, MKFS_EXT4_EXT_MAGIC);
+        wr_le16(raw + MKFS_EXT4_INODE_BLOCK + MKFS_EXT4_EXT_HDR_ENTRIES, 0U);
+        wr_le16(raw + MKFS_EXT4_INODE_BLOCK + MKFS_EXT4_EXT_HDR_MAX, 4U);
+        wr_le16(raw + MKFS_EXT4_INODE_BLOCK + MKFS_EXT4_EXT_HDR_DEPTH, 0U);
+    }
+    wr_le32(raw + MKFS_EXT4_INODE_SIZE_LO, 0U);
+    wr_le32(raw + MKFS_EXT4_INODE_BLOCKS_LO, 0U);
+    wr_le32(raw + MKFS_EXT4_INODE_DTIME, 0U);
+    return true;
+}
+
 static bool fsck_mark_data_block(fsck_state_t *st, uint32_t ino, uint64_t fs_block) {
     if (!st || fs_block == 0U || fs_block >= st->blocks_count) {
+        if (st && st->repair_mode == FSCK_REPAIR_FORCE &&
+            ino > 0U && ino <= st->inodes_count) {
+            st->inode_needs_data_clear[ino] = 1U;
+            return true;
+        }
         uart_puts("[fsck.ext4] fail: inode block out of range ino=");
         print_dec((int)ino);
         uart_puts(" blk=");
@@ -1507,6 +2100,11 @@ static bool fsck_mark_data_block(fsck_state_t *st, uint32_t ino, uint64_t fs_blo
         return false;
     }
     if (!fsck_dynamic_bit_is_set(st->block_alloc_map, fs_block)) {
+        if (st->repair_mode == FSCK_REPAIR_FORCE &&
+            ino > 0U && ino <= st->inodes_count) {
+            st->inode_needs_data_clear[ino] = 1U;
+            return true;
+        }
         uart_puts("[fsck.ext4] fail: inode block not allocated in bitmap ino=");
         print_dec((int)ino);
         uart_puts(" blk=");
@@ -1515,6 +2113,19 @@ static bool fsck_mark_data_block(fsck_state_t *st, uint32_t ino, uint64_t fs_blo
         return false;
     }
     if (fsck_dynamic_bit_is_set(st->seen_data_blocks, fs_block)) {
+        if (st->repair_mode == FSCK_REPAIR_FORCE &&
+            ino > 0U && ino <= st->inodes_count) {
+            st->inode_needs_data_clear[ino] = 1U;
+            return true;
+        }
+        if (st->repair_mode == FSCK_REPAIR_SAFE) {
+            uart_puts("[fsck.ext4] fail: duplicate block requires -y ino=");
+            print_dec((int)ino);
+            uart_puts(" blk=");
+            print_dec((int)fs_block);
+            uart_puts("\n");
+            return false;
+        }
         uart_puts("[fsck.ext4] fail: duplicate data block ino=");
         print_dec((int)ino);
         uart_puts(" blk=");
@@ -1781,7 +2392,8 @@ static int fsck_compat_class(uint32_t compat, uint32_t incompat, uint32_t ro_com
 }
 
 int fs_mkfs_ext4(const char *target, uint64_t flags, const fu_mkfs_ext4_opts_t *opts) {
-    if (!target || flags != 0U) {
+    bool strict_kernel = (flags & MKFS_EXT4_F_STRICT_KERNEL) != 0U;
+    if (!target || (flags & ~MKFS_EXT4_F_STRICT_KERNEL) != 0U) {
         return -1;
     }
 
@@ -1793,6 +2405,9 @@ int fs_mkfs_ext4(const char *target, uint64_t flags, const fu_mkfs_ext4_opts_t *
     if (mount_uses_source_dev(dev->dev_kind)) {
         return -1;
     }
+    if (pagecache_flush_all() != 0) {
+        return -1;
+    }
     if (block_cache_attach_inode(dev) != 0) {
         return -1;
     }
@@ -1800,6 +2415,15 @@ int fs_mkfs_ext4(const char *target, uint64_t flags, const fu_mkfs_ext4_opts_t *
     uint32_t feature_flags = MKFS_EXT4_FEAT_EXTENTS |
                              MKFS_EXT4_FEAT_SPARSE_SUPER |
                              MKFS_EXT4_FEAT_HAS_JOURNAL;
+    const uint32_t feature_mask_all = MKFS_EXT4_FEAT_EXTENTS |
+                                      MKFS_EXT4_FEAT_64BIT |
+                                      MKFS_EXT4_FEAT_METADATA_CSUM |
+                                      MKFS_EXT4_FEAT_SPARSE_SUPER |
+                                      MKFS_EXT4_FEAT_HAS_JOURNAL;
+    const uint32_t feature_mask_kernel_rw = MKFS_EXT4_FEAT_EXTENTS |
+                                            MKFS_EXT4_FEAT_64BIT |
+                                            MKFS_EXT4_FEAT_SPARSE_SUPER |
+                                            MKFS_EXT4_FEAT_HAS_JOURNAL;
     uint16_t reserved_pct = 0U;
     uint16_t stride = 0U;
     uint16_t profile = MKFS_EXT4_PROFILE_DEFAULT;
@@ -1819,7 +2443,7 @@ int fs_mkfs_ext4(const char *target, uint64_t flags, const fu_mkfs_ext4_opts_t *
         feature_flags = opts->feature_flags;
         reserved_pct = opts->reserved_pct;
         stride = opts->stride;
-        if (opts->profile > MKFS_EXT4_PROFILE_LARGEFILE) {
+        if (opts->profile > MKFS_EXT4_PROFILE_LARGEFILE4) {
             return -1;
         }
         profile = opts->profile;
@@ -1847,6 +2471,12 @@ int fs_mkfs_ext4(const char *target, uint64_t flags, const fu_mkfs_ext4_opts_t *
     bool has_metadata_csum = (feature_flags & MKFS_EXT4_FEAT_METADATA_CSUM) != 0U;
     bool sparse_super = (feature_flags & MKFS_EXT4_FEAT_SPARSE_SUPER) != 0U;
     bool has_journal = (feature_flags & MKFS_EXT4_FEAT_HAS_JOURNAL) != 0U;
+    if ((feature_flags & ~feature_mask_all) != 0U) {
+        return -1;
+    }
+    if (strict_kernel && (feature_flags & ~feature_mask_kernel_rw) != 0U) {
+        return -1;
+    }
 
     uint64_t sectors = block_cache_capacity_sectors();
     if (sectors < (uint64_t)MKFS_EXT4_SECTORS_PER_BLOCK * 64U) {
@@ -2453,6 +3083,7 @@ int fs_fsck_ext4(const char *target, uint64_t flags) {
     bool no_repair = (flags & FSCK_EXT4_F_NO_REPAIR) != 0U;
     bool do_preen = (flags & FSCK_EXT4_F_PREEN) != 0U;
     bool do_yes = (flags & FSCK_EXT4_F_YES) != 0U;
+    uint32_t repair_mode = FSCK_REPAIR_NONE;
     bool can_repair = false;
 
     if (!target) {
@@ -2471,7 +3102,12 @@ int fs_fsck_ext4(const char *target, uint64_t flags) {
         uart_puts("[fsck.ext4] fail: conflicting fsck mode\n");
         return -1;
     }
-    can_repair = do_preen || do_yes;
+    if (do_yes) {
+        repair_mode = FSCK_REPAIR_FORCE;
+    } else if (do_preen) {
+        repair_mode = FSCK_REPAIR_SAFE;
+    }
+    can_repair = repair_mode != FSCK_REPAIR_NONE;
 
     inode_t *dev = fs_lookup(target);
     if (!dev || dev->type != INODE_DEV || !dev_kind_is_block(dev->dev_kind) ||
@@ -2481,6 +3117,10 @@ int fs_fsck_ext4(const char *target, uint64_t flags) {
     }
     if (mount_uses_source_dev(dev->dev_kind)) {
         uart_puts("[fsck.ext4] fail: device mounted\n");
+        return -1;
+    }
+    if (pagecache_flush_all() != 0) {
+        uart_puts("[fsck.ext4] fail: pagecache flush\n");
         return -1;
     }
     if (block_cache_attach_inode(dev) != 0) {
@@ -2643,6 +3283,7 @@ int fs_fsck_ext4(const char *target, uint64_t flags) {
     size_t block_bits_bytes = (size_t)((blocks_count + 8ULL) / 8ULL);
     fsck_state_t st;
     memset(&st, 0, sizeof(st));
+    st.repair_mode = repair_mode;
     st.inodes_count = inodes_count;
     st.blocks_count = blocks_count;
     st.block_size = block_size;
@@ -2658,10 +3299,12 @@ int fs_fsck_ext4(const char *target, uint64_t flags) {
     st.inode_links_refs = (uint32_t *)pmm_alloc(((size_t)inodes_count + 1U) * sizeof(uint32_t), 8U);
     st.inode_parent = (uint32_t *)pmm_alloc(((size_t)inodes_count + 1U) * sizeof(uint32_t), 8U);
     st.inode_dot_flags = (uint8_t *)pmm_alloc((size_t)inodes_count + 1U, 8U);
+    st.inode_needs_data_clear = (uint8_t *)pmm_alloc((size_t)inodes_count + 1U, 8U);
     uint64_t *inode_tables = (uint64_t *)pmm_alloc((size_t)groups_count * sizeof(uint64_t), 8U);
     if (!st.inode_alloc_map || !st.block_alloc_map || !st.seen_data_blocks ||
         !st.inode_modes || !st.inode_links_disk || !st.inode_links_refs ||
-        !st.inode_parent || !st.inode_dot_flags || !inode_tables) {
+        !st.inode_parent || !st.inode_dot_flags || !st.inode_needs_data_clear ||
+        !inode_tables) {
         uart_puts("[fsck.ext4] fail: out of memory\n");
         return -1;
     }
@@ -2673,6 +3316,7 @@ int fs_fsck_ext4(const char *target, uint64_t flags) {
     memset(st.inode_links_refs, 0, ((size_t)inodes_count + 1U) * sizeof(uint32_t));
     memset(st.inode_parent, 0, ((size_t)inodes_count + 1U) * sizeof(uint32_t));
     memset(st.inode_dot_flags, 0, (size_t)inodes_count + 1U);
+    memset(st.inode_needs_data_clear, 0, (size_t)inodes_count + 1U);
 
     uint32_t gdt_base_block = (block_size == 1024U) ? 2U : 1U;
     uint32_t last_gdt_block = 0xFFFFFFFFU;
@@ -2907,7 +3551,34 @@ int fs_fsck_ext4(const char *target, uint64_t flags) {
                 .parse_dir = fsck_is_dir_mode(mode),
             };
             if (!fsck_iter_inode_data_blocks(raw, &st, fsck_visit_inode_block, &visit_ctx, ino)) {
-                return -1;
+                if (repair_mode != FSCK_REPAIR_FORCE || visit_ctx.parse_dir || ino == journal_inum) {
+                    if (repair_mode == FSCK_REPAIR_SAFE && !visit_ctx.parse_dir) {
+                        uart_puts("[fsck.ext4] fail: inode data repair requires -y ino=");
+                        print_dec((int)ino);
+                        uart_puts("\n");
+                    }
+                    return -1;
+                }
+                st.inode_needs_data_clear[ino] = 1U;
+            }
+            if (st.inode_needs_data_clear[ino] != 0U) {
+                if (repair_mode != FSCK_REPAIR_FORCE || visit_ctx.parse_dir || ino == journal_inum) {
+                    return -1;
+                }
+                if (!fsck_clear_inode_payload((uint8_t *)raw, inode_size)) {
+                    uart_puts("[fsck.ext4] fail: inode payload clear ino=");
+                    print_dec((int)ino);
+                    uart_puts("\n");
+                    return -1;
+                }
+                if (block_cache_write((uint64_t)inode_blk * sectors_per_block, blk_a, sectors_per_block) != 0) {
+                    uart_puts("[fsck.ext4] fail: inode payload write ino=");
+                    print_dec((int)ino);
+                    uart_puts("\n");
+                    return -1;
+                }
+                st.inode_needs_data_clear[ino] = 0U;
+                repaired++;
             }
         }
 
@@ -3186,7 +3857,7 @@ int fs_mount(const char *source, const char *target, const char *fstype, uint64_
     if (block_cache_attach_inode(src) != 0) {
         return -1;
     }
-    if (!ext4_mount(mnt)) {
+    if (!ext4_mount(mnt, src)) {
         return -1;
     }
 
@@ -3212,6 +3883,9 @@ int fs_umount(const char *target, uint64_t flags) {
     if (task_mount_busy(mnt, target)) {
         return -1;
     }
+    if (pagecache_flush_all() != 0) {
+        return -1;
+    }
 
     if (e->kind == FS_KIND_EXT4) {
         if (!ext4_unmount(mnt)) {
@@ -3223,6 +3897,11 @@ int fs_umount(const char *target, uint64_t flags) {
 
     memset(e, 0, sizeof(*e));
     return 0;
+}
+
+static int fs_ext4_tx_error(void) {
+    int err = ext4_last_error();
+    return err > 0 ? -err : -1;
 }
 
 inode_t *fs_create_file(const char *path) {
@@ -3300,12 +3979,12 @@ int fs_link(const char *old_path, const char *new_path) {
 
     if (src->fs_kind == FS_KIND_EXT4) {
         if (!ext4_tx_begin()) {
-            return -1;
+            return fs_ext4_tx_error();
         }
         int rc = ext4_link(src, parent, name);
         if (rc != 0 || !ext4_tx_commit()) {
             ext4_tx_abort();
-            return -1;
+            return rc != 0 ? rc : fs_ext4_tx_error();
         }
         return 0;
     }
@@ -3331,12 +4010,12 @@ int fs_symlink(const char *target, const char *link_path) {
 
     if (parent->fs_kind == FS_KIND_EXT4) {
         if (!ext4_tx_begin()) {
-            return -1;
+            return fs_ext4_tx_error();
         }
         inode_t *n = ext4_symlink(parent, name, target);
         if (!n || !ext4_tx_commit()) {
             ext4_tx_abort();
-            return -1;
+            return fs_ext4_tx_error();
         }
         return 0;
     }
@@ -3366,6 +4045,50 @@ int fs_lstat(const char *path, fu_stat_t *st) {
     return fs_fill_stat(ino, st);
 }
 
+int fs_stat(const char *path, fu_stat_t *st) {
+    inode_t *ino = fs_lookup(path);
+    if (!ino || !st) {
+        return -1;
+    }
+    return fs_fill_stat(ino, st);
+}
+
+int fs_chmod(const char *path, uint32_t mode) {
+    inode_t *ino = fs_lookup_nofollow(path);
+    if (!ino || ino == root_inode) {
+        return -1;
+    }
+
+    if (ino->fs_kind == FS_KIND_EXT4) {
+        if (!ext4_tx_begin()) {
+            return fs_ext4_tx_error();
+        }
+        int rc = ext4_chmod(ino, mode & 0777U);
+        if (rc != 0 || !ext4_tx_commit()) {
+            ext4_tx_abort();
+            return rc != 0 ? rc : fs_ext4_tx_error();
+        }
+        return 0;
+    }
+
+    if (ino->fs_kind != FS_KIND_MEM) {
+        return -1;
+    }
+    if (ino->type == INODE_FILE) {
+        bool immutable_blob = (ino->data != 0) && (ino->capacity == ino->size) && !ino->writable;
+        if (!immutable_blob) {
+            ino->writable = (mode & 0222U) != 0U;
+        }
+        ino->executable = (mode & 0111U) != 0U;
+        return 0;
+    }
+    if (ino->type == INODE_DIR || ino->type == INODE_DEV) {
+        ino->writable = (mode & 0222U) != 0U;
+        return 0;
+    }
+    return -1;
+}
+
 int fs_unlink(const char *path) {
     inode_t *ino = fs_lookup_nofollow(path);
     if (!ino || ino->type != INODE_FILE || !ino->parent) {
@@ -3373,12 +4096,12 @@ int fs_unlink(const char *path) {
     }
     if (ino->fs_kind == FS_KIND_EXT4) {
         if (!ext4_tx_begin()) {
-            return -1;
+            return fs_ext4_tx_error();
         }
         int rc = ext4_unlink(ino);
         if (rc != 0 || !ext4_tx_commit()) {
             ext4_tx_abort();
-            return -1;
+            return rc != 0 ? rc : fs_ext4_tx_error();
         }
         pagecache_invalidate_inode(ino);
         return 0;
@@ -3403,12 +4126,12 @@ int fs_rmdir(const char *path) {
     }
     if (ino->fs_kind == FS_KIND_EXT4) {
         if (!ext4_tx_begin()) {
-            return -1;
+            return fs_ext4_tx_error();
         }
         int rc = ext4_rmdir(ino);
         if (rc != 0 || !ext4_tx_commit()) {
             ext4_tx_abort();
-            return -1;
+            return rc != 0 ? rc : fs_ext4_tx_error();
         }
         return 0;
     }
@@ -3453,12 +4176,12 @@ int fs_rename(const char *old_path, const char *new_path) {
             return -1;
         }
         if (!ext4_tx_begin()) {
-            return -1;
+            return fs_ext4_tx_error();
         }
         int rc = ext4_rename(ino, new_parent, new_name);
         if (rc != 0 || !ext4_tx_commit()) {
             ext4_tx_abort();
-            return -1;
+            return rc != 0 ? rc : fs_ext4_tx_error();
         }
         return 0;
     }
@@ -3506,12 +4229,10 @@ int fs_read(inode_t *inode, size_t *offset, void *buf, size_t len) {
         return -1;
     }
     if (inode->fs_kind == FS_KIND_EXT4) {
-        size_t start = *offset;
-        int n = ext4_read(inode, offset, buf, len);
-        if (n > 0 && inode->type == INODE_FILE) {
-            pagecache_overlay_read(inode, start, buf, (size_t)n);
+        if (inode->type == INODE_FILE) {
+            return pagecache_read(inode, offset, buf, len);
         }
-        return n;
+        return ext4_read(inode, offset, buf, len);
     }
 
     if (inode->type == INODE_DEV) {
@@ -3538,25 +4259,10 @@ int fs_read(inode_t *inode, size_t *offset, void *buf, size_t len) {
                 *offset += done;
                 return (int)done;
             }
-            case DEV_VDA:
-            case DEV_SDA:
-            case DEV_SDB:
-            case DEV_SDC:
-            case DEV_SDD:
-            case DEV_SDE:
-            case DEV_SDF:
-            case DEV_SDG:
-            case DEV_SDH:
-            case DEV_NVME0N1:
-            case DEV_NVME1N1:
-            case DEV_NVME2N1:
-            case DEV_NVME3N1:
-            case DEV_NVME4N1:
-            case DEV_NVME5N1:
-            case DEV_NVME6N1:
-            case DEV_NVME7N1:
-                return dev_block_read_inode(inode, offset, buf, len);
             default:
+                if (fs_is_block_dev(inode)) {
+                    return pagecache_read(inode, offset, buf, len);
+                }
                 return -1;
         }
     }
@@ -3578,18 +4284,10 @@ int fs_read(inode_t *inode, size_t *offset, void *buf, size_t len) {
         return (int)sizeof(ent);
     }
 
-    if (inode->type != INODE_FILE || *offset >= inode->size) {
+    if (inode->type != INODE_FILE) {
         return 0;
     }
-
-    size_t n = len;
-    if (*offset + n > inode->size) {
-        n = inode->size - *offset;
-    }
-    memcpy(buf, inode->data + *offset, n);
-    pagecache_overlay_read(inode, *offset, buf, n);
-    *offset += n;
-    return (int)n;
+    return pagecache_read(inode, offset, buf, len);
 }
 
 int fs_write(inode_t *inode, size_t *offset, const void *buf, size_t len) {
@@ -3597,19 +4295,10 @@ int fs_write(inode_t *inode, size_t *offset, const void *buf, size_t len) {
         return -1;
     }
     if (inode->fs_kind == FS_KIND_EXT4) {
-        size_t start = *offset;
-        if (!ext4_tx_begin()) {
-            return -1;
+        if (inode->type == INODE_FILE) {
+            return pagecache_write(inode, offset, buf, len);
         }
-        int n = ext4_write(inode, offset, buf, len);
-        if (n <= 0 || !ext4_tx_commit()) {
-            ext4_tx_abort();
-            return -1;
-        }
-        if (n > 0 && inode->type == INODE_FILE) {
-            pagecache_notify_write(inode, start, buf, (size_t)n);
-        }
-        return n;
+        return -1;
     }
     if (inode->type == INODE_DEV) {
         switch (inode->dev_kind) {
@@ -3625,45 +4314,25 @@ int fs_write(inode_t *inode, size_t *offset, const void *buf, size_t len) {
                 *offset += len;
                 return (int)len;
             }
-            case DEV_VDA:
-            case DEV_SDA:
-            case DEV_SDB:
-            case DEV_SDC:
-            case DEV_SDD:
-            case DEV_SDE:
-            case DEV_SDF:
-            case DEV_SDG:
-            case DEV_SDH:
-            case DEV_NVME0N1:
-            case DEV_NVME1N1:
-            case DEV_NVME2N1:
-            case DEV_NVME3N1:
-            case DEV_NVME4N1:
-            case DEV_NVME5N1:
-            case DEV_NVME6N1:
-            case DEV_NVME7N1:
-                return dev_block_write_inode(inode, offset, buf, len);
             default:
+                if (fs_is_block_dev(inode)) {
+                    return pagecache_write(inode, offset, buf, len);
+                }
                 return -1;
         }
     }
     if (inode->fs_kind != FS_KIND_MEM || inode->type != INODE_FILE || !inode->writable) {
         return -1;
     }
-    if (*offset >= inode->capacity) {
-        return -1;
+    if (len > 0U) {
+        if (*offset > (size_t)-1 - len) {
+            return -1;
+        }
+        if (!memfs_ensure_capacity(inode, *offset + len)) {
+            return -1;
+        }
     }
-    size_t n = len;
-    if (*offset + n > inode->capacity) {
-        n = inode->capacity - *offset;
-    }
-    memcpy(inode->data + *offset, buf, n);
-    pagecache_notify_write(inode, *offset, buf, n);
-    *offset += n;
-    if (*offset > inode->size) {
-        inode->size = *offset;
-    }
-    return (int)n;
+    return pagecache_write(inode, offset, buf, len);
 }
 
 int fs_truncate(inode_t *inode, size_t size) {
@@ -3671,13 +4340,16 @@ int fs_truncate(inode_t *inode, size_t size) {
         return -1;
     }
     if (inode->fs_kind == FS_KIND_EXT4) {
-        if (!ext4_tx_begin()) {
+        if (pagecache_flush_inode(inode) != 0) {
             return -1;
+        }
+        if (!ext4_tx_begin()) {
+            return fs_ext4_tx_error();
         }
         int rc = ext4_truncate(inode, size);
         if (rc != 0 || !ext4_tx_commit()) {
             ext4_tx_abort();
-            return -1;
+            return rc != 0 ? rc : fs_ext4_tx_error();
         }
         if (rc == 0) {
             pagecache_invalidate_inode(inode);
@@ -3687,7 +4359,10 @@ int fs_truncate(inode_t *inode, size_t size) {
     if (inode->fs_kind != FS_KIND_MEM || inode->type != INODE_FILE || !inode->writable) {
         return -1;
     }
-    if (size > inode->capacity) {
+    if (pagecache_flush_inode(inode) != 0) {
+        return -1;
+    }
+    if (size > inode->capacity && !memfs_ensure_capacity(inode, size)) {
         return -1;
     }
     if (size > inode->size) {
@@ -3695,5 +4370,43 @@ int fs_truncate(inode_t *inode, size_t size) {
     }
     inode->size = size;
     pagecache_invalidate_inode(inode);
+    return 0;
+}
+
+int fs_sync_inode(inode_t *inode) {
+    if (!inode) {
+        return -1;
+    }
+
+    if (inode->type == INODE_FILE || fs_is_block_dev(inode)) {
+        if (pagecache_flush_inode(inode) != 0) {
+            return -1;
+        }
+    }
+
+    if (inode->fs_kind == FS_KIND_EXT4) {
+        if (!ext4_sync_filesystem()) {
+            return -1;
+        }
+    }
+
+    if (inode->type == INODE_DEV && dev_kind_is_block(inode->dev_kind)) {
+        if (block_cache_flush() != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int fs_sync_all(void) {
+    if (pagecache_flush_all() != 0) {
+        return -1;
+    }
+    if (!ext4_sync_filesystem()) {
+        return -1;
+    }
+    if (block_cache_flush() != 0) {
+        return -1;
+    }
     return 0;
 }

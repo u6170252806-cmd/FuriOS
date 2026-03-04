@@ -25,6 +25,8 @@
 static uint64_t kernel_l1[TT_ENTRIES] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t kernel_l2_low[TT_ENTRIES] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t kernel_ttbr1_l1[TT_ENTRIES] __attribute__((aligned(PAGE_SIZE)));
+static uint64_t active_ttbr0;
+static bool active_ttbr0_valid;
 
 #define TTBR_ASID_SHIFT 48
 #define TTBR_ASID_MASK  0xFFFFUL
@@ -98,8 +100,13 @@ uint64_t mmu_ttbr0_value(uint64_t ttbr0_phys, uint16_t asid) {
 
 void mmu_switch_ttbr0(uint64_t ttbr0_phys, uint16_t asid) {
     uint64_t ttbr = mmu_ttbr0_value(ttbr0_phys, asid);
+    if (active_ttbr0_valid && active_ttbr0 == ttbr) {
+        return;
+    }
     __asm__ volatile("msr ttbr0_el1, %0" :: "r"(ttbr));
     isb();
+    active_ttbr0 = ttbr;
+    active_ttbr0_valid = true;
 }
 
 uint64_t mmu_kernel_ttbr1(void) {
@@ -151,6 +158,8 @@ void mmu_init(void) {
     __asm__ volatile("msr tcr_el1, %0" :: "r"(tcr));
     __asm__ volatile("msr ttbr0_el1, %0" :: "r"((uint64_t)kernel_l1));
     __asm__ volatile("msr ttbr1_el1, %0" :: "r"((uint64_t)kernel_ttbr1_l1));
+    active_ttbr0 = (uint64_t)kernel_l1;
+    active_ttbr0_valid = true;
 
     dsb_ish();
     isb();

@@ -24,6 +24,7 @@ static uint64_t active_lba_count;
 static bool selftest_done;
 
 static const char *dev_name(dev_kind_t kind) {
+    static char nvme_name[24];
     switch (kind) {
         case DEV_VDA: return "vda";
         case DEV_SDA: return "sda";
@@ -34,16 +35,31 @@ static const char *dev_name(dev_kind_t kind) {
         case DEV_SDF: return "sdf";
         case DEV_SDG: return "sdg";
         case DEV_SDH: return "sdh";
-        case DEV_NVME0N1: return "nvme0n1";
-        case DEV_NVME1N1: return "nvme1n1";
-        case DEV_NVME2N1: return "nvme2n1";
-        case DEV_NVME3N1: return "nvme3n1";
-        case DEV_NVME4N1: return "nvme4n1";
-        case DEV_NVME5N1: return "nvme5n1";
-        case DEV_NVME6N1: return "nvme6n1";
-        case DEV_NVME7N1: return "nvme7n1";
-        default: return "?";
+        default: break;
     }
+    if (kind >= DEV_NVME_BASE && kind <= DEV_NVME_LAST) {
+        uint32_t idx = (uint32_t)(kind - DEV_NVME_BASE);
+        uint32_t ctrl = idx / NVME_MAX_NAMESPACES;
+        uint32_t nsid = (idx % NVME_MAX_NAMESPACES) + 1U;
+        memset(nvme_name, 0, sizeof(nvme_name));
+        nvme_name[0] = 'n';
+        nvme_name[1] = 'v';
+        nvme_name[2] = 'm';
+        nvme_name[3] = 'e';
+        size_t pos = 4U;
+        if (ctrl >= 10U) {
+            nvme_name[pos++] = (char)('0' + (ctrl / 10U));
+        }
+        nvme_name[pos++] = (char)('0' + (ctrl % 10U));
+        nvme_name[pos++] = 'n';
+        if (nsid >= 10U) {
+            nvme_name[pos++] = (char)('0' + (nsid / 10U));
+        }
+        nvme_name[pos++] = (char)('0' + (nsid % 10U));
+        nvme_name[pos] = '\0';
+        return nvme_name;
+    }
+    return "?";
 }
 
 static int sata_index_for_kind(dev_kind_t kind) {
@@ -53,68 +69,79 @@ static int sata_index_for_kind(dev_kind_t kind) {
     return (int)(kind - DEV_SDA);
 }
 
-static int nvme_index_for_kind(dev_kind_t kind) {
-    if (kind < DEV_NVME0N1 || kind > DEV_NVME7N1) {
-        return -1;
+static bool nvme_decode_kind(dev_kind_t kind, uint32_t *ctrl_out, uint32_t *nsid_out) {
+    if (kind < DEV_NVME_BASE || kind > DEV_NVME_LAST) {
+        return false;
     }
-    return (int)(kind - DEV_NVME0N1);
+    uint32_t idx = (uint32_t)(kind - DEV_NVME_BASE);
+    uint32_t ctrl = idx / NVME_MAX_NAMESPACES;
+    uint32_t nsid = (idx % NVME_MAX_NAMESPACES) + 1U;
+    if (ctrl >= NVME_MAX_CONTROLLERS || nsid == 0U || nsid > NVME_MAX_NAMESPACES) {
+        return false;
+    }
+    if (ctrl_out) {
+        *ctrl_out = ctrl;
+    }
+    if (nsid_out) {
+        *nsid_out = nsid;
+    }
+    return true;
 }
 
 static bool backend_ready(dev_kind_t kind) {
     int sidx = sata_index_for_kind(kind);
-    int nidx = nvme_index_for_kind(kind);
+    uint32_t nctrl = 0U;
+    uint32_t nsid = 0U;
     if (kind == DEV_VDA) {
         return virtio_blk_ready();
     }
     if (sidx >= 0) {
         return ahci_disk_present((uint32_t)sidx);
     }
-    if (nidx >= 0) {
-        return nvme_disk_present((uint32_t)nidx);
+    if (nvme_decode_kind(kind, &nctrl, &nsid)) {
+        return nvme_ns_present(nctrl, nsid);
     }
     return false;
 }
 
 static uint32_t backend_block_size(dev_kind_t kind) {
-    int nidx = nvme_index_for_kind(kind);
     if (kind == DEV_VDA) {
         return virtio_blk_block_size();
     }
-    if (sata_index_for_kind(kind) >= 0) {
+    if (sata_index_for_kind(kind) >= 0 || (kind >= DEV_NVME_BASE && kind <= DEV_NVME_LAST)) {
         return VIRTIO_BLK_SECTOR_SIZE;
-    }
-    if (nidx >= 0) {
-        return nvme_disk_sector_size((uint32_t)nidx);
     }
     return 0;
 }
 
 static int backend_rw(dev_kind_t kind, uint64_t lba, void *buf, bool write) {
     int sidx = sata_index_for_kind(kind);
-    int nidx = nvme_index_for_kind(kind);
+    uint32_t nctrl = 0U;
+    uint32_t nsid = 0U;
     if (kind == DEV_VDA) {
         return virtio_blk_rw_sector(lba, buf, write);
     }
     if (sidx >= 0) {
         return ahci_rw_sector((uint32_t)sidx, lba, buf, write);
     }
-    if (nidx >= 0) {
-        return nvme_rw_sector((uint32_t)nidx, lba, buf, write);
+    if (nvme_decode_kind(kind, &nctrl, &nsid)) {
+        return nvme_ns_rw_sector(nctrl, nsid, lba, buf, write);
     }
     return -1;
 }
 
 static int backend_flush(dev_kind_t kind) {
     int sidx = sata_index_for_kind(kind);
-    int nidx = nvme_index_for_kind(kind);
+    uint32_t nctrl = 0U;
+    uint32_t nsid = 0U;
     if (kind == DEV_VDA) {
         return virtio_blk_flush();
     }
     if (sidx >= 0) {
         return ahci_flush((uint32_t)sidx);
     }
-    if (nidx >= 0) {
-        return nvme_flush((uint32_t)nidx);
+    if (nvme_decode_kind(kind, &nctrl, &nsid)) {
+        return nvme_ns_flush(nctrl, nsid);
     }
     return -1;
 }
@@ -347,6 +374,5 @@ static bool cache_selftest(void) {
     if (block_cache_read(cap, a, 1) == 0) {
         return false;
     }
-    uart_puts("[block-cache] selftest ok\n");
     return true;
 }

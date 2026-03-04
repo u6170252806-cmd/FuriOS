@@ -89,22 +89,56 @@ fi
 
 NVME_DISK_SIZE="${NVME_DISK_SIZE:-256M}"
 NVME_DISK_PREFIX="${NVME_DISK_PREFIX:-build/nvme}"
+NVME_NS_PER_CTRL="${NVME_NS_PER_CTRL:-1}"
+NVME_LBA_SIZE="${NVME_LBA_SIZE:-512}"
+if [[ ! "$NVME_NS_PER_CTRL" =~ ^[0-9]+$ ]]; then
+  echo "invalid NVME_NS_PER_CTRL: $NVME_NS_PER_CTRL" >&2
+  exit 1
+fi
+if [[ ! "$NVME_LBA_SIZE" =~ ^[0-9]+$ ]]; then
+  echo "invalid NVME_LBA_SIZE: $NVME_LBA_SIZE" >&2
+  exit 1
+fi
+if [[ "$NVME_NS_PER_CTRL" -lt 1 ]]; then
+  NVME_NS_PER_CTRL=1
+fi
+if [[ "$NVME_NS_PER_CTRL" -gt 8 ]]; then
+  NVME_NS_PER_CTRL=8
+fi
 if [[ "$NVME_COUNT" -gt 0 ]]; then
   for ((i=0; i<NVME_COUNT; i++)); do
-    NVME_IMG="${NVME_DISK_PREFIX}${i}.img"
     NVME_ADDR="$(printf "0x%x" $((6 + i)))"
-    if [[ ! -f "$NVME_IMG" ]]; then
-      mkdir -p "$(dirname "$NVME_IMG")"
-      truncate -s "$NVME_DISK_SIZE" "$NVME_IMG"
-    fi
     QEMU_STORAGE_ARGS+=(
-      -drive if=none,file="$NVME_IMG",format=raw,id=nvme${i}
-      -device nvme,serial=FuriNVMe${i},drive=nvme${i},bus=pcie.0,addr=${NVME_ADDR}
+      -device nvme,id=nvmec${i},serial=FuriNVMe${i},bus=pcie.0,addr=${NVME_ADDR}
     )
+    for ((ns=1; ns<=NVME_NS_PER_CTRL; ns++)); do
+      NVME_IMG="${NVME_DISK_PREFIX}${i}n${ns}.img"
+      if [[ ! -f "$NVME_IMG" ]]; then
+        mkdir -p "$(dirname "$NVME_IMG")"
+        truncate -s "$NVME_DISK_SIZE" "$NVME_IMG"
+      fi
+      QEMU_STORAGE_ARGS+=(
+        -drive if=none,file="$NVME_IMG",format=raw,id=nvme${i}_${ns}
+        -device nvme-ns,drive=nvme${i}_${ns},bus=nvmec${i},nsid=${ns},logical_block_size=${NVME_LBA_SIZE},physical_block_size=${NVME_LBA_SIZE}
+      )
+    done
   done
 fi
 
-exec qemu-system-aarch64 \
+STTY_OLD=""
+if [[ -t 0 ]]; then
+  STTY_OLD="$(stty -g 2>/dev/null || true)"
+  stty -ixon -ixoff 2>/dev/null || true
+fi
+
+restore_tty() {
+  if [[ -n "$STTY_OLD" ]]; then
+    stty "$STTY_OLD" 2>/dev/null || true
+  fi
+}
+trap restore_tty EXIT INT TERM
+
+qemu-system-aarch64 \
   -machine virt,virtualization=on,gic-version=2 \
   -cpu cortex-a53 \
   -m 256M \

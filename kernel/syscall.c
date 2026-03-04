@@ -1,11 +1,17 @@
 #include "syscall.h"
 #include "task.h"
 #include "fs.h"
+#include "elf.h"
 #include "pipe.h"
 #include "user_copy.h"
 #include "string.h"
 #include "timer.h"
 #include "uart.h"
+#include "pmm.h"
+#include "config.h"
+#include "pagecache.h"
+
+#define EXEC_IMAGE_MAX (16U * 1024U * 1024U)
 
 static int normalize_abs_path(const char *in, char *out, size_t outsz) {
     char comps[16][INODE_NAME_MAX + 1];
@@ -105,6 +111,117 @@ static bool open_flags_valid(int flags) {
     return (flags & ~allowed) == 0;
 }
 
+static uint64_t align_up_u64(uint64_t value, uint64_t align) {
+    if (align == 0U) {
+        return value;
+    }
+    return (value + align - 1U) & ~(align - 1U);
+}
+
+static void free_exec_image_pages(uint8_t *buf, size_t alloc_size) {
+    if (!buf || alloc_size == 0U) {
+        return;
+    }
+    for (size_t off = 0; off < alloc_size; off += PAGE_SIZE) {
+        pmm_free_page(buf + off);
+    }
+}
+
+static bool load_exec_image(inode_t *inode, const uint8_t **image_out, size_t *size_out,
+                            uint8_t **owned_buf_out, size_t *owned_size_out) {
+    if (!inode || inode->type != INODE_FILE || !image_out || !size_out ||
+        !owned_buf_out || !owned_size_out || inode->size == 0U) {
+        return false;
+    }
+
+    *image_out = 0;
+    *size_out = 0U;
+    *owned_buf_out = 0;
+    *owned_size_out = 0U;
+
+    if (inode->data) {
+        *image_out = inode->data;
+        *size_out = inode->size;
+        return true;
+    }
+
+    if (inode->size > EXEC_IMAGE_MAX) {
+        return false;
+    }
+
+    uint64_t alloc64 = align_up_u64((uint64_t)inode->size, PAGE_SIZE);
+    if (alloc64 == 0U || alloc64 > (uint64_t)SIZE_MAX) {
+        return false;
+    }
+    size_t alloc_size = (size_t)alloc64;
+    uint8_t *buf = (uint8_t *)pmm_alloc(alloc_size, PAGE_SIZE);
+    if (!buf) {
+        return false;
+    }
+
+    size_t src_off = 0U;
+    size_t dst_off = 0U;
+    while (dst_off < inode->size) {
+        int n = fs_read(inode, &src_off, buf + dst_off, inode->size - dst_off);
+        if (n <= 0) {
+            free_exec_image_pages(buf, alloc_size);
+            return false;
+        }
+        dst_off += (size_t)n;
+    }
+
+    *image_out = buf;
+    *size_out = inode->size;
+    *owned_buf_out = buf;
+    *owned_size_out = alloc_size;
+    return true;
+}
+
+/* Returns 1 if PT_INTERP is present, 0 if not present, -1 on malformed ELF. */
+static int elf_interp_path(const uint8_t *image, size_t image_size, char *out, size_t outsz) {
+    if (!image || !out || outsz < 2U || image_size < sizeof(Elf64_Ehdr)) {
+        return -1;
+    }
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)image;
+    if (eh->e_ident[EI_MAG0] != ELFMAG0 ||
+        eh->e_ident[EI_MAG1] != ELFMAG1 ||
+        eh->e_ident[EI_MAG2] != ELFMAG2 ||
+        eh->e_ident[EI_MAG3] != ELFMAG3 ||
+        eh->e_ident[EI_CLASS] != ELFCLASS64 ||
+        eh->e_machine != EM_AARCH64) {
+        return -1;
+    }
+    if (eh->e_phentsize != sizeof(Elf64_Phdr)) {
+        return -1;
+    }
+    if (eh->e_phoff > image_size ||
+        (uint64_t)eh->e_phnum * eh->e_phentsize > image_size - eh->e_phoff) {
+        return -1;
+    }
+
+    const Elf64_Phdr *ph = (const Elf64_Phdr *)(image + eh->e_phoff);
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type != PT_INTERP) {
+            continue;
+        }
+        if (ph[i].p_filesz == 0U || ph[i].p_filesz >= outsz) {
+            return -1;
+        }
+        if (ph[i].p_offset > image_size ||
+            ph[i].p_filesz > image_size - ph[i].p_offset) {
+            return -1;
+        }
+        const char *src = (const char *)(image + ph[i].p_offset);
+        memcpy(out, src, (size_t)ph[i].p_filesz);
+        out[ph[i].p_filesz] = '\0';
+        if (out[0] != '/') {
+            return -1;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 #define MAX_POLL_FDS 16
 
 static long sys_write_impl(trapframe_t *tf, uint64_t fd, uint64_t buf, uint64_t len,
@@ -149,6 +266,7 @@ static long sys_write_impl(trapframe_t *tf, uint64_t fd, uint64_t buf, uint64_t 
         }
         uint8_t tmp[128];
         uint64_t done = 0;
+        int stalled_writes = 0;
         while (done < len) {
             uint64_t chunk = len - done;
             if (chunk > sizeof(tmp)) {
@@ -162,8 +280,14 @@ static long sys_write_impl(trapframe_t *tf, uint64_t fd, uint64_t buf, uint64_t 
             }
             int n = fs_write(f->inode, &f->offset, tmp, (size_t)chunk);
             if (n <= 0) {
+                if (f->inode->type == INODE_FILE && stalled_writes < 3) {
+                    stalled_writes++;
+                    (void)pagecache_flush_inode(f->inode);
+                    continue;
+                }
                 return done ? (long)done : -1;
             }
+            stalled_writes = 0;
             done += (uint64_t)n;
         }
         return (long)done;
@@ -416,8 +540,7 @@ static long sys_close_impl(trapframe_t *tf, uint64_t fd, uint64_t a1, uint64_t a
     if (!t || fd >= MAX_FDS) {
         return -1;
     }
-    task_fd_close(t, (int)fd);
-    return 0;
+    return task_fd_close(t, (int)fd);
 }
 
 static long sys_dup2_impl(trapframe_t *tf, uint64_t oldfd, uint64_t newfd, uint64_t a2,
@@ -578,7 +701,11 @@ static long sys_exec_impl(trapframe_t *tf, uint64_t path, uint64_t argv_ptr, uin
     }
 
     inode_t *ino = fs_lookup(kpath);
-    if (!ino || ino->type != INODE_FILE || !ino->executable) {
+    if (!ino || ino->type != INODE_FILE) {
+        return -1;
+    }
+    fu_stat_t st;
+    if (fs_stat_inode(ino, &st) != 0 || (st.mode & 0111U) == 0U) {
         return -1;
     }
 
@@ -603,10 +730,86 @@ static long sys_exec_impl(trapframe_t *tf, uint64_t path, uint64_t argv_ptr, uin
         }
     }
 
-    int rc = task_exec(t, ino->data, ino->size, kargv_store);
+    const uint8_t *image = 0;
+    size_t image_size = 0U;
+    uint8_t *owned_image = 0;
+    size_t owned_image_size = 0U;
+    if (!load_exec_image(ino, &image, &image_size, &owned_image, &owned_image_size)) {
+        return -1;
+    }
+
+    int rc = -1;
+    char interp_path[MAX_PATH];
+    int interp_state = elf_interp_path(image, image_size, interp_path, sizeof(interp_path));
+    bool use_interp = (interp_state == 1) && strcmp(kpath, interp_path) != 0;
+
+    if (!use_interp) {
+        rc = task_exec(t, image, image_size, kargv_store);
+    } else {
+        inode_t *interp_ino = fs_lookup(interp_path);
+        fu_stat_t interp_st;
+        const uint8_t *interp_image = 0;
+        size_t interp_size = 0U;
+        uint8_t *interp_owned = 0;
+        size_t interp_owned_size = 0U;
+        const char *interp_argv[MAX_ARGV + 1];
+        char interp_arg_buf[MAX_ARGV][MAX_ARG_LEN];
+        int ia = 0;
+
+        memset(interp_argv, 0, sizeof(interp_argv));
+        memset(interp_arg_buf, 0, sizeof(interp_arg_buf));
+
+        if (!interp_ino || interp_ino->type != INODE_FILE ||
+            fs_stat_inode(interp_ino, &interp_st) != 0 || (interp_st.mode & 0111U) == 0U ||
+            !load_exec_image(interp_ino, &interp_image, &interp_size, &interp_owned,
+                             &interp_owned_size)) {
+            if (interp_owned) {
+                free_exec_image_pages(interp_owned, interp_owned_size);
+            }
+            if (owned_image) {
+                free_exec_image_pages(owned_image, owned_image_size);
+            }
+            return -1;
+        }
+
+        strncpy(interp_arg_buf[ia], interp_path, MAX_ARG_LEN - 1U);
+        interp_argv[ia] = interp_arg_buf[ia];
+        ia++;
+
+        if (ia < MAX_ARGV) {
+            strncpy(interp_arg_buf[ia], kpath, MAX_ARG_LEN - 1U);
+            interp_argv[ia] = interp_arg_buf[ia];
+            ia++;
+        }
+
+        if (kargv_store[0]) {
+            for (int i = 0; i < MAX_ARGV && kargv_store[i] && ia < MAX_ARGV; i++, ia++) {
+                strncpy(interp_arg_buf[ia], kargv_store[i], MAX_ARG_LEN - 1U);
+                interp_argv[ia] = interp_arg_buf[ia];
+            }
+        } else if (ia < MAX_ARGV) {
+            strncpy(interp_arg_buf[ia], kpath, MAX_ARG_LEN - 1U);
+            interp_argv[ia] = interp_arg_buf[ia];
+            ia++;
+        }
+        interp_argv[ia] = 0;
+
+        rc = task_exec(t, interp_image, interp_size, interp_argv);
+        if (rc == 0) {
+            task_load_debug_symbols(t, image, image_size);
+        }
+        if (interp_owned) {
+            free_exec_image_pages(interp_owned, interp_owned_size);
+        }
+    }
+
+    if (owned_image) {
+        free_exec_image_pages(owned_image, owned_image_size);
+    }
     if (rc != 0) {
         return -1;
     }
+    task_set_comm(t, kpath);
 
     if (!t->tf) {
         return -1;
@@ -879,6 +1082,95 @@ static long sys_mprotect_impl(trapframe_t *tf, uint64_t addr, uint64_t len, uint
     return task_mprotect(addr, len, (int)prot);
 }
 
+static long sys_fsync_impl(trapframe_t *tf, uint64_t fd, uint64_t a1, uint64_t a2,
+                           uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)tf;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+
+    task_t *t = task_current();
+    if (!t || fd >= MAX_FDS || !t->fds[fd].used) {
+        return -1;
+    }
+    fd_t *f = &t->fds[fd];
+    if (f->kind != FD_INODE || !f->inode) {
+        return -1;
+    }
+    return fs_sync_inode(f->inode);
+}
+
+static long sys_msync_impl(trapframe_t *tf, uint64_t addr, uint64_t len, uint64_t flags,
+                           uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)tf;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    return task_msync(addr, len, flags);
+}
+
+static long sys_sigaction_impl(trapframe_t *tf, uint64_t sig, uint64_t act_ptr, uint64_t old_ptr,
+                               uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)tf;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+
+    fu_sigaction_t act_local;
+    fu_sigaction_t old_local;
+    fu_sigaction_t *act = 0;
+    fu_sigaction_t *old = 0;
+
+    if (act_ptr) {
+        if (copy_from_user(&act_local, (const void *)act_ptr, sizeof(act_local)) != 0) {
+            return -1;
+        }
+        act = &act_local;
+    }
+    if (old_ptr) {
+        old = &old_local;
+    }
+
+    int rc = task_sigaction((int)sig, act, old);
+    if (rc < 0) {
+        return rc;
+    }
+    if (old_ptr && copy_to_user((void *)old_ptr, &old_local, sizeof(old_local)) != 0) {
+        return -1;
+    }
+    return rc;
+}
+
+static long sys_sigprocmask_impl(trapframe_t *tf, uint64_t how, uint64_t set, uint64_t old_ptr,
+                                 uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)tf;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    uint64_t old = 0;
+    int rc = task_sigprocmask((int)how, set, old_ptr ? &old : 0);
+    if (rc < 0) {
+        return rc;
+    }
+    if (old_ptr && copy_to_user((void *)old_ptr, &old, sizeof(old)) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static long sys_sigreturn_impl(trapframe_t *tf, uint64_t a0, uint64_t a1, uint64_t a2,
+                               uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)a0;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    return task_sigreturn(tf);
+}
+
 static long sys_chdir_impl(trapframe_t *tf, uint64_t path, uint64_t a1, uint64_t a2,
                            uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)tf;
@@ -909,6 +1201,30 @@ static long sys_chdir_impl(trapframe_t *tf, uint64_t path, uint64_t a1, uint64_t
 
     strcpy(t->cwd, kpath);
     return 0;
+}
+
+static long sys_chmod_impl(trapframe_t *tf, uint64_t path, uint64_t mode, uint64_t a2,
+                           uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)tf;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+
+    task_t *t = task_current();
+    if (!t) {
+        return -1;
+    }
+
+    char input_path[MAX_PATH];
+    char kpath[MAX_PATH];
+    if (copy_user_str(input_path, (const char *)path, sizeof(input_path)) != 0) {
+        return -1;
+    }
+    if (resolve_path(t, input_path, kpath, sizeof(kpath)) != 0) {
+        return -1;
+    }
+    return fs_chmod(kpath, (uint32_t)mode);
 }
 
 static long sys_mkdir_impl(trapframe_t *tf, uint64_t path, uint64_t a1, uint64_t a2,
@@ -1293,6 +1609,116 @@ static long sys_lstat_impl(trapframe_t *tf, uint64_t path, uint64_t statbuf, uin
     return 0;
 }
 
+static long sys_stat_impl(trapframe_t *tf, uint64_t path, uint64_t statbuf, uint64_t a2,
+                          uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)tf;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+
+    task_t *t = task_current();
+    if (!t || path == 0 || statbuf == 0) {
+        return -1;
+    }
+
+    char in_path[MAX_PATH];
+    char kpath[MAX_PATH];
+    fu_stat_t st;
+    if (copy_user_str(in_path, (const char *)path, sizeof(in_path)) != 0) {
+        return -1;
+    }
+    if (resolve_path(t, in_path, kpath, sizeof(kpath)) != 0) {
+        return -1;
+    }
+    if (fs_stat(kpath, &st) != 0) {
+        return -1;
+    }
+    if (copy_to_user((void *)statbuf, &st, sizeof(st)) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static long sys_fstat_impl(trapframe_t *tf, uint64_t fd, uint64_t statbuf, uint64_t a2,
+                           uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)tf;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+
+    task_t *t = task_current();
+    if (!t || statbuf == 0 || fd >= MAX_FDS || !t->fds[fd].used) {
+        return -1;
+    }
+
+    fd_t *f = &t->fds[fd];
+    fu_stat_t st;
+    memset(&st, 0, sizeof(st));
+    if (f->kind == FD_INODE) {
+        if (!f->inode || fs_stat_inode(f->inode, &st) != 0) {
+            return -1;
+        }
+    } else if (f->kind == FD_PIPE_R || f->kind == FD_PIPE_W) {
+        st.type = 0U;
+        st.mode = 0x1000U | 0666U;
+        st.size = 0U;
+        st.nlink = 1U;
+        st.fs_kind = 0U;
+    } else {
+        st.type = (uint32_t)INODE_DEV;
+        st.mode = 0x2000U | 0666U;
+        st.size = 0U;
+        st.nlink = 1U;
+        st.fs_kind = 0U;
+    }
+    if (copy_to_user((void *)statbuf, &st, sizeof(st)) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static long sys_lseek_impl(trapframe_t *tf, uint64_t fd, uint64_t offset, uint64_t whence,
+                           uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)tf;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+
+    task_t *t = task_current();
+    if (!t || fd >= MAX_FDS || !t->fds[fd].used) {
+        return -1;
+    }
+    fd_t *f = &t->fds[fd];
+    if (f->kind != FD_INODE || !f->inode) {
+        return -1;
+    }
+
+    int64_t off = (int64_t)offset;
+    int64_t base = 0;
+    switch ((int)whence) {
+        case SEEK_SET:
+            base = 0;
+            break;
+        case SEEK_CUR:
+            base = (int64_t)f->offset;
+            break;
+        case SEEK_END:
+            base = (int64_t)f->inode->size;
+            break;
+        default:
+            return -1;
+    }
+
+    int64_t pos = base + off;
+    if (pos < 0) {
+        return -1;
+    }
+    f->offset = (size_t)pos;
+    return pos;
+}
+
 typedef long (*sys_fn_t)(trapframe_t *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 
 typedef struct {
@@ -1319,7 +1745,10 @@ typedef struct {
 #define SYSCALL_HANDLER_FOR_SYS_MMAP   sys_mmap_impl
 #define SYSCALL_HANDLER_FOR_SYS_MUNMAP sys_munmap_impl
 #define SYSCALL_HANDLER_FOR_SYS_MPROTECT sys_mprotect_impl
+#define SYSCALL_HANDLER_FOR_SYS_FSYNC  sys_fsync_impl
+#define SYSCALL_HANDLER_FOR_SYS_MSYNC  sys_msync_impl
 #define SYSCALL_HANDLER_FOR_SYS_CHDIR  sys_chdir_impl
+#define SYSCALL_HANDLER_FOR_SYS_CHMOD  sys_chmod_impl
 #define SYSCALL_HANDLER_FOR_SYS_MKDIR  sys_mkdir_impl
 #define SYSCALL_HANDLER_FOR_SYS_RMDIR  sys_rmdir_impl
 #define SYSCALL_HANDLER_FOR_SYS_UNLINK sys_unlink_impl
@@ -1337,6 +1766,12 @@ typedef struct {
 #define SYSCALL_HANDLER_FOR_SYS_SYMLINK sys_symlink_impl
 #define SYSCALL_HANDLER_FOR_SYS_READLINK sys_readlink_impl
 #define SYSCALL_HANDLER_FOR_SYS_LSTAT  sys_lstat_impl
+#define SYSCALL_HANDLER_FOR_SYS_STAT   sys_stat_impl
+#define SYSCALL_HANDLER_FOR_SYS_FSTAT  sys_fstat_impl
+#define SYSCALL_HANDLER_FOR_SYS_LSEEK  sys_lseek_impl
+#define SYSCALL_HANDLER_FOR_SYS_SIGACTION sys_sigaction_impl
+#define SYSCALL_HANDLER_FOR_SYS_SIGPROCMASK sys_sigprocmask_impl
+#define SYSCALL_HANDLER_FOR_SYS_SIGRETURN sys_sigreturn_impl
 #define SYSCALL_HANDLER_FOR(sym)       SYSCALL_HANDLER_FOR_##sym
 
 enum {

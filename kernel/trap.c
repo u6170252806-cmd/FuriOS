@@ -8,6 +8,8 @@
 #include "virtio_blk.h"
 #include "ahci.h"
 #include "nvme.h"
+#include "pagecache.h"
+#include "ext4.h"
 
 long syscall_dispatch(trapframe_t *tf, bool *force_resched);
 
@@ -23,13 +25,37 @@ long syscall_dispatch(trapframe_t *tf, bool *force_resched);
 #define ESR_FSC_TYPE_MASK 0x3CUL
 #define ESR_FSC_FAULT 0x04UL
 
-static void print_trap(const char *name, uint64_t esr, uint64_t far) {
+static void print_trap(const char *name, trapframe_t *tf, uint64_t esr, uint64_t far) {
     uart_puts("[trap] ");
     uart_puts(name);
+    task_t *cur = task_current();
+    if (cur) {
+        uart_puts(" pid=");
+        print_dec(cur->pid);
+        uart_puts(" comm=");
+        const char *comm = task_comm(cur);
+        uart_puts((comm && comm[0]) ? comm : "?");
+    }
     uart_puts(" esr=");
     print_hex64(esr);
     uart_puts(" far=");
     print_hex64(far);
+    uart_puts(" elr=");
+    print_hex64(tf ? tf->elr_el1 : 0);
+    if (cur && tf) {
+        const char *sym = 0;
+        uint64_t sym_start = 0;
+        uint64_t sym_end = 0;
+        if (task_symbolize_pc(cur, tf->elr_el1, &sym, &sym_start, &sym_end) &&
+            sym && sym[0]) {
+            uart_puts(" sym=");
+            uart_puts(sym);
+            uart_puts("+");
+            print_hex64(tf->elr_el1 - sym_start);
+            uart_puts("/");
+            print_hex64(sym_end - sym_start);
+        }
+    }
     uart_puts("\n");
 }
 
@@ -54,7 +80,7 @@ trapframe_t *trap_handle_sync(trapframe_t *tf, uint64_t esr, uint64_t far) {
         }
     }
 
-    print_trap("sync", esr, far);
+    print_trap("sync", tf, esr, far);
     if (task_current()) {
         if (is_current_abort && (far < USER_VA_BASE || far >= USER_VA_LIMIT)) {
             panic("kernel page fault");
@@ -74,22 +100,31 @@ trapframe_t *trap_handle_irq(trapframe_t *tf) {
 
     if (intid == TIMER_IRQ) {
         timer_handle_irq();
-        if (task_wake_sleepers(timer_ticks())) {
+        uint64_t now_ticks = timer_ticks();
+        pagecache_tick(now_ticks);
+        ext4_periodic_maintenance(now_ticks);
+        if (task_wake_sleepers(now_ticks)) {
             force_resched = from_el0;
         }
         if (from_el0) {
             force_resched = true;
         }
-    } else if (virtio_blk_handle_irq(intid)) {
-        /* handled */
-    } else if (ahci_handle_irq(intid)) {
-        /* handled */
-    } else if (nvme_handle_irq(intid)) {
-        /* handled */
-    } else if (intid != 1023U) {
+    } else {
+        bool handled = false;
+        if (virtio_blk_handle_irq(intid)) {
+            handled = true;
+        }
+        if (ahci_handle_irq(intid)) {
+            handled = true;
+        }
+        if (nvme_handle_irq(intid)) {
+            handled = true;
+        }
+        if (!handled && intid != 1023U) {
         uart_puts("[trap] unexpected irq=");
         print_dec((int)intid);
         uart_puts("\n");
+        }
     }
 
     gic_eoi_irq(iar);

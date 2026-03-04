@@ -219,6 +219,9 @@ typedef struct {
     uint32_t free_inodes_count;
     uint32_t groups_count;
     inode_t *mountpoint;
+    dev_kind_t source_dev_kind;
+    uint64_t source_lba_start;
+    uint64_t source_lba_count;
     ext4_meta_t root_meta;
     inode_t cache_nodes[EXT4_CACHE_MAX];
     ext4_meta_t cache_meta[EXT4_CACHE_MAX];
@@ -305,12 +308,16 @@ typedef struct {
     ext4_jbd2_dirty_t tx_dirty[EXT4_JBD2_TX_MAX_BLOCKS];
     uint32_t tx_revoke_count;
     uint64_t tx_revokes[EXT4_JBD2_TX_MAX_REVOKES];
+    bool tx_revoke_overflow;
+    bool tx_enospc;
+    uint64_t last_enospc_log_tick;
     uint32_t pending_count;
     ext4_jbd2_pending_t pending[EXT4_JBD2_MAX_PENDING_TX];
 } ext4_jbd2_state_t;
 static ext4_jbd2_update_t g_jbd2_updates[EXT4_JBD2_MAX_UPDATES];
 static ext4_jbd2_revoke_t g_jbd2_revokes[EXT4_JBD2_MAX_REVOKES];
 static ext4_jbd2_state_t g_jbd2;
+static int g_ext4_last_errno;
 static uint32_t g_ext4_symlink_depth;
 static int ext4_read_file_at(const ext4_meta_t *m, uint64_t off, void *buf, size_t len);
 static bool ext4_is_inline_symlink(const ext4_meta_t *m);
@@ -333,6 +340,7 @@ static bool ext4_jbd2_parse_descriptor_block(const ext4_meta_t *journal_meta,
 static bool ext4_jbd2_apply_updates(const ext4_meta_t *journal_meta,
                                     uint32_t update_count,
                                     uint32_t revoke_count);
+static bool ext4_jbd2_maybe_checkpoint(bool force);
 
 static uint16_t rd_be16(const uint8_t *p) {
     return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
@@ -400,9 +408,26 @@ static uint32_t crc32c_update(uint32_t crc, const void *buf, size_t len) {
     return ~c;
 }
 
+static bool ext4_attach_source_dev(void) {
+    if (g_ext4.source_dev_kind == DEV_NONE || g_ext4.source_lba_count == 0U) {
+        return false;
+    }
+    inode_t dev;
+    memset(&dev, 0, sizeof(dev));
+    dev.type = INODE_DEV;
+    dev.dev_kind = g_ext4.source_dev_kind;
+    dev.dev_lba_start = g_ext4.source_lba_start;
+    dev.dev_lba_count = g_ext4.source_lba_count;
+    return block_cache_attach_inode(&dev) == 0;
+}
+
 static bool ext4_raw_read_bytes(uint64_t byte_off, void *buf, size_t len) {
     uint8_t sec[VIRTIO_BLK_SECTOR_SIZE];
     uint8_t *dst = (uint8_t *)buf;
+
+    if (!ext4_attach_source_dev()) {
+        return false;
+    }
 
     while (len > 0) {
         uint64_t lba = byte_off / VIRTIO_BLK_SECTOR_SIZE;
@@ -425,6 +450,10 @@ static bool ext4_raw_read_bytes(uint64_t byte_off, void *buf, size_t len) {
 static bool ext4_raw_write_bytes(uint64_t byte_off, const void *buf, size_t len) {
     uint8_t sec[VIRTIO_BLK_SECTOR_SIZE];
     const uint8_t *src = (const uint8_t *)buf;
+
+    if (!ext4_attach_source_dev()) {
+        return false;
+    }
 
     while (len > 0) {
         uint64_t lba = byte_off / VIRTIO_BLK_SECTOR_SIZE;
@@ -472,13 +501,19 @@ static bool ext4_journal_clear(void) {
 }
 
 bool ext4_tx_begin(void) {
+    g_ext4_last_errno = 0;
     if (g_jbd2.enabled) {
-        return ext4_jbd2_tx_start();
+        bool ok = ext4_jbd2_tx_start();
+        if (!ok) {
+            g_ext4_last_errno = g_jbd2.tx_enospc ? 28 : 5;
+        }
+        return ok;
     }
     if (!g_journal.enabled) {
         return true;
     }
     if (g_journal.tx_active) {
+        g_ext4_last_errno = 16;
         return false;
     }
     g_journal.tx_active = true;
@@ -487,10 +522,12 @@ bool ext4_tx_begin(void) {
     g_journal.seq++;
     if (!ext4_journal_write_header(EXT4_JLOG_STATE_PREP, 0U, 0U, g_journal.seq)) {
         g_journal.tx_active = false;
+        g_ext4_last_errno = 5;
         return false;
     }
     if (block_cache_flush() != 0) {
         g_journal.tx_active = false;
+        g_ext4_last_errno = 5;
         return false;
     }
     return true;
@@ -515,7 +552,11 @@ bool ext4_tx_commit(void) {
     uint32_t data_bytes;
 
     if (g_jbd2.enabled) {
-        return ext4_jbd2_tx_commit();
+        bool ok = ext4_jbd2_tx_commit();
+        if (!ok) {
+            g_ext4_last_errno = g_jbd2.tx_enospc ? 28 : 5;
+        }
+        return ok;
     }
     if (!g_journal.enabled) {
         return true;
@@ -529,9 +570,11 @@ bool ext4_tx_commit(void) {
 
     if (!ext4_journal_write_header(EXT4_JLOG_STATE_COMMIT, rec_count,
                                    data_bytes, g_journal.seq)) {
+        g_ext4_last_errno = 5;
         return false;
     }
     if (block_cache_flush() != 0) {
+        g_ext4_last_errno = 5;
         return false;
     }
 
@@ -540,21 +583,41 @@ bool ext4_tx_commit(void) {
         const ext4_jlog_rec_t *r = &g_journal.recs[i];
         if (!ext4_raw_write_bytes(r->byte_off, g_journal.data + r->data_off, r->len)) {
             g_journal.replaying = false;
+            g_ext4_last_errno = 5;
             return false;
         }
     }
     g_journal.replaying = false;
 
     if (block_cache_flush() != 0) {
+        g_ext4_last_errno = 5;
         return false;
     }
     if (!ext4_journal_clear()) {
+        g_ext4_last_errno = 5;
         return false;
     }
 
     g_journal.rec_count = 0U;
     g_journal.data_bytes = 0U;
+    g_ext4_last_errno = 0;
     return true;
+}
+
+int ext4_last_error(void) {
+    return g_ext4_last_errno;
+}
+
+void ext4_periodic_maintenance(uint64_t now_ticks) {
+    if (!g_ext4.mounted) {
+        return;
+    }
+    if (g_jbd2.enabled && !g_jbd2.tx_active && g_jbd2.pending_count > 0U) {
+        if (g_jbd2.pending_count >= EXT4_JBD2_CHECKPOINT_BATCH ||
+            now_ticks - g_jbd2.last_checkpoint_tick >= (EXT4_JBD2_CHECKPOINT_AGE / 2U)) {
+            (void)ext4_jbd2_maybe_checkpoint(false);
+        }
+    }
 }
 
 static bool ext4_disk_read_bytes(uint64_t byte_off, void *buf, size_t len) {
@@ -697,6 +760,34 @@ static uint32_t ext4_jbd2_ring_distance(uint32_t from, uint32_t to) {
     return ring - (from_idx - to_idx);
 }
 
+static uint32_t ext4_jbd2_ring_free_blocks(void) {
+    uint32_t ring = g_jbd2.maxlen - g_jbd2.first;
+    if (ring <= 1U) {
+        return 0U;
+    }
+
+    uint32_t head = g_jbd2.head;
+    if (head < g_jbd2.first || head >= g_jbd2.maxlen) {
+        head = g_jbd2.first;
+    }
+    uint32_t tail = (g_jbd2.pending_count > 0U) ? g_jbd2.tail : head;
+    if (tail < g_jbd2.first || tail >= g_jbd2.maxlen) {
+        tail = g_jbd2.first;
+    }
+
+    if (g_jbd2.pending_count == 0U) {
+        return ring - 1U;
+    }
+    if (head == tail) {
+        return 0U;
+    }
+    uint32_t distance = ext4_jbd2_ring_distance(head, tail);
+    if (distance <= 1U) {
+        return 0U;
+    }
+    return distance - 1U;
+}
+
 static bool ext4_jbd2_read_jblock(const ext4_meta_t *journal_meta, uint32_t j_block, uint8_t *buf) {
     uint64_t pblock = 0;
     if (!journal_meta || !buf) {
@@ -729,7 +820,7 @@ static bool ext4_jbd2_is_revoked(uint64_t fs_block, uint32_t revoke_count) {
 }
 
 static bool ext4_jbd2_add_revoke(uint64_t fs_block, uint32_t *revoke_count_io) {
-    if (!revoke_count_io) {
+    if (!revoke_count_io || fs_block >= g_ext4.blocks_count) {
         return false;
     }
     for (uint32_t i = 0; i < *revoke_count_io; i++) {
@@ -748,6 +839,12 @@ static bool ext4_jbd2_add_revoke(uint64_t fs_block, uint32_t *revoke_count_io) {
 static bool ext4_jbd2_add_update(uint64_t fs_block, uint32_t j_block, bool escape,
                                  uint32_t *update_count_io) {
     if (!update_count_io || *update_count_io >= EXT4_JBD2_MAX_UPDATES) {
+        return false;
+    }
+    if (fs_block >= g_ext4.blocks_count) {
+        return false;
+    }
+    if (j_block < g_jbd2.first || j_block >= g_jbd2.maxlen) {
         return false;
     }
     g_jbd2_updates[*update_count_io].fs_block = fs_block;
@@ -975,6 +1072,29 @@ static bool ext4_jbd2_maybe_checkpoint(bool force) {
     return true;
 }
 
+bool ext4_sync_filesystem(void) {
+    if (!g_ext4.mounted) {
+        return true;
+    }
+    if (g_jbd2.enabled) {
+        if (g_jbd2.tx_active) {
+            return false;
+        }
+        while (g_jbd2.pending_count > 0U) {
+            if (!ext4_jbd2_checkpoint_some(EXT4_JBD2_CHECKPOINT_BATCH)) {
+                return false;
+            }
+        }
+        if (!ext4_jbd2_store_super()) {
+            return false;
+        }
+    }
+    if (g_journal.tx_active) {
+        return false;
+    }
+    return block_cache_flush() == 0;
+}
+
 static int ext4_jbd2_find_dirty(uint64_t fs_block) {
     for (uint32_t i = 0; i < g_jbd2.tx_dirty_count; i++) {
         if (g_jbd2.tx_dirty[i].used && g_jbd2.tx_dirty[i].fs_block == fs_block) {
@@ -986,6 +1106,7 @@ static int ext4_jbd2_find_dirty(uint64_t fs_block) {
 
 static int ext4_jbd2_alloc_dirty(uint64_t fs_block) {
     if (g_jbd2.tx_dirty_count >= EXT4_JBD2_TX_MAX_BLOCKS) {
+        g_jbd2.tx_enospc = true;
         return -1;
     }
     uint32_t i = g_jbd2.tx_dirty_count++;
@@ -1080,9 +1201,9 @@ static bool ext4_jbd2_tx_write_bytes(uint64_t byte_off, const void *buf, size_t 
             if (idx < 0) {
                 return false;
             }
-        } else {
-            ext4_jbd2_remove_revoke(fs_block);
         }
+        /* Any metadata write to this block supersedes a prior revoke in this tx. */
+        ext4_jbd2_remove_revoke(fs_block);
         memcpy(g_jbd2.tx_dirty[idx].data + in_block, src, chunk);
         src += chunk;
         byte_off += chunk;
@@ -1092,7 +1213,7 @@ static bool ext4_jbd2_tx_write_bytes(uint64_t byte_off, const void *buf, size_t 
 }
 
 static void ext4_jbd2_note_revoke(uint64_t fs_block) {
-    if (!g_jbd2.enabled || !g_jbd2.tx_active || fs_block == 0U ||
+    if (!g_jbd2.enabled || !g_jbd2.tx_active ||
         fs_block >= g_ext4.blocks_count) {
         return;
     }
@@ -1103,7 +1224,9 @@ static void ext4_jbd2_note_revoke(uint64_t fs_block) {
     }
     if (g_jbd2.tx_revoke_count < EXT4_JBD2_TX_MAX_REVOKES) {
         g_jbd2.tx_revokes[g_jbd2.tx_revoke_count++] = fs_block;
+        return;
     }
+    g_jbd2.tx_revoke_overflow = true;
 }
 
 static bool ext4_jbd2_parse_revoke_block(const uint8_t *blk,
@@ -1210,6 +1333,9 @@ static bool ext4_jbd2_parse_descriptor_block(const ext4_meta_t *journal_meta,
         bool deleted = (flags & JBD2_FLAG_DELETED) != 0U;
         if ((flags & ~(JBD2_FLAG_ESCAPE | JBD2_FLAG_SAME_UUID |
                        JBD2_FLAG_DELETED | JBD2_FLAG_LAST_TAG)) != 0U) {
+            return false;
+        }
+        if (fs_block >= g_ext4.blocks_count) {
             return false;
         }
 
@@ -1389,6 +1515,7 @@ static bool ext4_jbd2_replay_if_needed(const uint8_t *ext4_sb) {
     uint32_t replayed = 0U;
     bool tx_open = false;
     uint32_t guard = g_jbd2.maxlen * 4U;
+    bool exhausted = true;
     if (guard < 64U) {
         guard = 64U;
     }
@@ -1405,6 +1532,7 @@ static bool ext4_jbd2_replay_if_needed(const uint8_t *ext4_sb) {
             update_count = 0U;
             revoke_count = 0U;
             tx_open = false;
+            exhausted = false;
             break;
         }
 
@@ -1450,12 +1578,21 @@ static bool ext4_jbd2_replay_if_needed(const uint8_t *ext4_sb) {
             continue;
         }
         if (type == JBD2_SUPERBLOCK_V1 || type == JBD2_SUPERBLOCK_V2) {
+            if (tx_open || update_count != 0U || revoke_count != 0U) {
+                return false;
+            }
+            if (!ext4_jbd2_verify_super_checksum(blk)) {
+                return false;
+            }
             cursor = ext4_jbd2_next_block(cursor, g_jbd2.first, g_jbd2.maxlen);
             if (cursor == 0U) {
                 return false;
             }
             continue;
         }
+        return false;
+    }
+    if (exhausted) {
         return false;
     }
 
@@ -1500,15 +1637,21 @@ static bool ext4_jbd2_replay_if_needed(const uint8_t *ext4_sb) {
         return false;
     }
 
-    uart_puts("[ext4] jbd2 replay tx=");
-    print_dec((int)replayed);
-    uart_puts("\n");
+    (void)replayed;
     return true;
 }
 
 static bool ext4_jbd2_tx_start(void) {
     if (!g_jbd2.enabled) {
         return true;
+    }
+    g_jbd2.tx_enospc = false;
+    if (g_jbd2.pending_count >= EXT4_JBD2_MAX_PENDING_TX) {
+        if (!ext4_jbd2_checkpoint_some(EXT4_JBD2_CHECKPOINT_BATCH) ||
+            g_jbd2.pending_count >= EXT4_JBD2_MAX_PENDING_TX) {
+            g_jbd2.tx_enospc = true;
+            return false;
+        }
     }
     if (!ext4_jbd2_maybe_checkpoint(false)) {
         return false;
@@ -1518,8 +1661,10 @@ static bool ext4_jbd2_tx_start(void) {
     }
     g_jbd2.tx_active = true;
     g_jbd2.io_bypass = false;
+    g_jbd2.tx_enospc = false;
     g_jbd2.tx_dirty_count = 0U;
     g_jbd2.tx_revoke_count = 0U;
+    g_jbd2.tx_revoke_overflow = false;
     memset(g_jbd2.tx_dirty, 0, sizeof(g_jbd2.tx_dirty));
     return true;
 }
@@ -1530,8 +1675,10 @@ static void ext4_jbd2_tx_abort(void) {
     }
     g_jbd2.tx_active = false;
     g_jbd2.io_bypass = false;
+    g_jbd2.tx_enospc = false;
     g_jbd2.tx_dirty_count = 0U;
     g_jbd2.tx_revoke_count = 0U;
+    g_jbd2.tx_revoke_overflow = false;
 }
 
 static bool ext4_jbd2_tx_emit_commit(uint32_t tx_seq, uint32_t *cursor_io) {
@@ -1566,29 +1713,51 @@ static bool ext4_jbd2_reserve_ring(uint32_t blocks, uint32_t *start_out, uint32_
     if (ring <= 1U || blocks >= ring) {
         return false;
     }
-
-    uint32_t tail = (g_jbd2.pending_count > 0U) ? g_jbd2.tail : g_jbd2.head;
-    if (tail < g_jbd2.first || tail >= g_jbd2.maxlen) {
-        tail = g_jbd2.first;
+    if (blocks > ext4_jbd2_ring_free_blocks()) {
+        return false;
     }
+
     uint32_t head = g_jbd2.head;
     if (head < g_jbd2.first || head >= g_jbd2.maxlen) {
         head = g_jbd2.first;
     }
-
-    if (g_jbd2.pending_count == 0U) {
-        *start_out = head;
-        *next_head_out = ext4_jbd2_ring_advance(head, blocks);
-        return *next_head_out != 0U;
-    }
-
-    uint32_t distance = ext4_jbd2_ring_distance(head, tail);
-    if (distance <= 1U || blocks >= distance) {
-        return false;
-    }
     *start_out = head;
     *next_head_out = ext4_jbd2_ring_advance(head, blocks);
-    return *next_head_out != 0U && *next_head_out != tail;
+    if (*next_head_out == 0U) {
+        return false;
+    }
+    if (g_jbd2.pending_count == 0U) {
+        return *next_head_out != head;
+    }
+    uint32_t tail = g_jbd2.tail;
+    if (tail < g_jbd2.first || tail >= g_jbd2.maxlen) {
+        tail = g_jbd2.first;
+    }
+    return *next_head_out != tail;
+}
+
+static void ext4_jbd2_log_enospc(uint32_t need_blocks) {
+    uint64_t now = timer_ticks();
+    uint64_t min_gap = TIMER_HZ / 5U;
+    if (min_gap == 0U) {
+        min_gap = 1U;
+    }
+    if (now - g_jbd2.last_enospc_log_tick < min_gap) {
+        return;
+    }
+    g_jbd2.last_enospc_log_tick = now;
+
+    uart_puts("[ext4] jbd2 enospc need=");
+    print_dec((int)need_blocks);
+    uart_puts(" free=");
+    print_dec((int)ext4_jbd2_ring_free_blocks());
+    uart_puts(" head=");
+    print_dec((int)g_jbd2.head);
+    uart_puts(" tail=");
+    print_dec((int)g_jbd2.tail);
+    uart_puts(" pending=");
+    print_dec((int)g_jbd2.pending_count);
+    uart_puts("\n");
 }
 
 static bool ext4_jbd2_tx_commit(void) {
@@ -1598,12 +1767,23 @@ static bool ext4_jbd2_tx_commit(void) {
     if (!g_jbd2.tx_active || !g_jbd2.write_ready) {
         return false;
     }
+    g_jbd2.tx_enospc = false;
+    if (g_jbd2.tx_revoke_overflow) {
+        g_jbd2.tx_enospc = true;
+        ext4_jbd2_log_enospc(g_jbd2.tx_revoke_count + 1U);
+        return false;
+    }
     if (g_jbd2.tx_dirty_count == 0U && g_jbd2.tx_revoke_count == 0U) {
         g_jbd2.tx_active = false;
         return true;
     }
     if (g_jbd2.pending_count >= EXT4_JBD2_MAX_PENDING_TX) {
-        return false;
+        if (!ext4_jbd2_checkpoint_some(EXT4_JBD2_CHECKPOINT_BATCH) ||
+            g_jbd2.pending_count >= EXT4_JBD2_MAX_PENDING_TX) {
+            g_jbd2.tx_enospc = true;
+            ext4_jbd2_log_enospc(1U);
+            return false;
+        }
     }
 
     uint32_t tag_bytes = ext4_jbd2_tx_tag_bytes();
@@ -1625,10 +1805,30 @@ static bool ext4_jbd2_tx_commit(void) {
     uint32_t revoke_blocks = (g_jbd2.tx_revoke_count == 0U) ? 0U :
                              (g_jbd2.tx_revoke_count + revoke_per_block - 1U) / revoke_per_block;
     uint32_t total_blocks = g_jbd2.tx_dirty_count + desc_blocks + revoke_blocks + 1U;
+    uint32_t ring = g_jbd2.maxlen - g_jbd2.first;
+    if (ring <= 1U || total_blocks >= ring) {
+        g_jbd2.tx_enospc = true;
+        ext4_jbd2_log_enospc(total_blocks);
+        return false;
+    }
     uint32_t tx_start = 0U;
     uint32_t tx_next_head = 0U;
-    if (!ext4_jbd2_reserve_ring(total_blocks, &tx_start, &tx_next_head)) {
-        return false;
+    uint32_t reserve_tries = 0U;
+    while (!ext4_jbd2_reserve_ring(total_blocks, &tx_start, &tx_next_head)) {
+        if (g_jbd2.pending_count == 0U) {
+            g_jbd2.tx_enospc = true;
+            ext4_jbd2_log_enospc(total_blocks);
+            return false;
+        }
+        if (!ext4_jbd2_checkpoint_some(EXT4_JBD2_CHECKPOINT_BATCH)) {
+            return false;
+        }
+        reserve_tries++;
+        if (reserve_tries > EXT4_JBD2_MAX_PENDING_TX) {
+            g_jbd2.tx_enospc = true;
+            ext4_jbd2_log_enospc(total_blocks);
+            return false;
+        }
     }
 
     uint8_t desc[4096];
@@ -1787,9 +1987,11 @@ static bool ext4_jbd2_tx_commit(void) {
     }
     g_jbd2.io_bypass = false;
     g_jbd2.tx_active = false;
+    g_jbd2.tx_enospc = false;
     g_jbd2.tx_dirty_count = 0U;
     g_jbd2.tx_revoke_count = 0U;
-    return ext4_jbd2_maybe_checkpoint(false);
+    g_jbd2.tx_revoke_overflow = false;
+    return true;
 }
 
 static bool ext4_ordered_checkpoint(void) {
@@ -3910,6 +4112,9 @@ int ext4_write(inode_t *inode, size_t *offset, const void *buf, size_t len) {
     if (!m || !ext4_is_reg_mode(m->mode)) {
         return -1;
     }
+    if ((uint64_t)inode->size > m->size) {
+        m->size = (uint64_t)inode->size;
+    }
     bool use_extents = (m->flags & EXT4_EXTENTS_FL) != 0U;
     if (!use_extents && !ext4_prepare_writable_nonextent(m)) {
         return -1;
@@ -4382,8 +4587,50 @@ int ext4_lstat(inode_t *inode, fu_stat_t *st) {
     return 0;
 }
 
-bool ext4_mount(inode_t *mountpoint) {
-    if (!mountpoint || mountpoint->type != INODE_DIR) {
+int ext4_chmod(inode_t *inode, uint32_t mode) {
+    if (!inode || inode->fs_kind != FS_KIND_EXT4 || !g_ext4.mounted || !g_ext4.write_enabled) {
+        return -1;
+    }
+
+    ext4_meta_t local_meta;
+    ext4_meta_t *m = ext4_meta_for_inode(inode);
+    if (!m) {
+        if (!ext4_load_meta(inode->fs_ino, &local_meta)) {
+            return -1;
+        }
+        m = &local_meta;
+    }
+
+    if (!ext4_is_reg_mode(m->mode) && !ext4_is_dir_mode(m->mode) && !ext4_is_lnk_mode(m->mode)) {
+        return -1;
+    }
+
+    uint16_t old_mode = m->mode;
+    uint16_t new_mode = (uint16_t)((old_mode & EXT4_S_IFMT) | (mode & 0777U));
+    if (old_mode == new_mode) {
+        return 0;
+    }
+
+    m->mode = new_mode;
+    if (!ext4_inode_store(m)) {
+        m->mode = old_mode;
+        return -1;
+    }
+    if (block_cache_flush() != 0) {
+        return -1;
+    }
+
+    inode->writable = g_ext4.write_enabled &&
+                     ext4_is_reg_mode(new_mode) &&
+                     ((new_mode & 0222U) != 0U);
+    inode->executable = ext4_is_reg_mode(new_mode) && ((new_mode & 0111U) != 0U);
+    return 0;
+}
+
+bool ext4_mount(inode_t *mountpoint, const inode_t *source_dev) {
+    if (!mountpoint || mountpoint->type != INODE_DIR ||
+        !source_dev || source_dev->type != INODE_DEV ||
+        source_dev->dev_kind == DEV_NONE) {
         return false;
     }
     if (g_ext4.mounted) {
@@ -4396,6 +4643,12 @@ bool ext4_mount(inode_t *mountpoint) {
     }
 
     memset(&g_ext4, 0, sizeof(g_ext4));
+    g_ext4.source_dev_kind = source_dev->dev_kind;
+    g_ext4.source_lba_start = source_dev->dev_lba_start;
+    g_ext4.source_lba_count = source_dev->dev_lba_count;
+    if (g_ext4.source_lba_count == 0U) {
+        return false;
+    }
 
     uint8_t sb[EXT4_SUPER_SIZE];
     if (!ext4_disk_read_bytes(EXT4_SUPER_OFFSET, sb, sizeof(sb))) {
@@ -4589,16 +4842,11 @@ bool ext4_unmount(inode_t *mountpoint) {
     if (ext4_inode_abs_path(mountpoint, mount_path, sizeof(mount_path)) != 0) {
         strcpy(mount_path, "(unknown)");
     }
-    if (g_jbd2.enabled && g_jbd2.pending_count > 0U) {
-        if (!ext4_jbd2_checkpoint_some(EXT4_JBD2_MAX_PENDING_TX)) {
-            return false;
-        }
-    }
-    if (block_cache_flush() != 0) {
-        return false;
-    }
     if (g_journal.tx_active) {
         ext4_tx_abort();
+    }
+    if (!ext4_sync_filesystem()) {
+        return false;
     }
 
     mountpoint->fs_kind = FS_KIND_MEM;

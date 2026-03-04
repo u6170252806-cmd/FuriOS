@@ -312,6 +312,7 @@ static void wait_children(const int *pids, int count) {
     for (int i = 0; i < count; i++) {
         int status = 0;
         (void)sys_waitpid(pids[i], &status, 0);
+        (void)status;
     }
 }
 

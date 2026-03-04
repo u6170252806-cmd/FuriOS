@@ -62,6 +62,7 @@
 #define VIRTIO_BLK_T_FLUSH       4U
 
 #define VIRTIO_IO_TIMEOUT_CYCLES_DIV 2U
+#define VIRTIO_IO_MAX_RETRIES       3U
 
 typedef struct {
     uint64_t addr;
@@ -95,6 +96,14 @@ typedef struct {
     uint64_t sector;
 } __attribute__((packed)) virtio_blk_req_hdr_t;
 
+typedef enum {
+    VIRTIO_IO_OK = 0,
+    VIRTIO_IO_NOT_READY,
+    VIRTIO_IO_TIMEOUT,
+    VIRTIO_IO_BAD_USED,
+    VIRTIO_IO_STATUS,
+} virtio_io_status_t;
+
 static uint8_t vq_mem[PAGE_SIZE * 2] __attribute__((aligned(PAGE_SIZE)));
 static virtq_desc_t *vq_desc;
 static virtq_avail_t *vq_avail;
@@ -116,6 +125,11 @@ static volatile uint32_t vq_irq_events;
 static volatile uint32_t cfg_irq_events;
 
 static uint64_t io_timeout_cycles;
+static uint32_t io_fail_streak;
+static uint32_t io_timeout_count;
+static uint32_t io_bad_used_count;
+static uint32_t io_status_count;
+static uint32_t io_reset_count;
 
 static virtio_blk_req_hdr_t req_hdr;
 static uint8_t req_status;
@@ -245,8 +259,15 @@ static bool virtio_wait_for_completion(uint16_t target_used_idx) {
 
 static int virtio_submit_request(uint32_t type, uint64_t sector,
                                  void *data, uint32_t data_len,
-                                 bool data_is_write) {
+                                 bool data_is_write,
+                                 virtio_io_status_t *status_out) {
+    if (status_out) {
+        *status_out = VIRTIO_IO_OK;
+    }
     if (!blk_ready || !vq_desc || !vq_avail || !vq_used || vq_size < 2U) {
+        if (status_out) {
+            *status_out = VIRTIO_IO_NOT_READY;
+        }
         return -1;
     }
 
@@ -263,6 +284,9 @@ static int virtio_submit_request(uint32_t type, uint64_t sector,
 
     if (data_len != 0U) {
         if (!data || vq_size < 3U) {
+            if (status_out) {
+                *status_out = VIRTIO_IO_BAD_USED;
+            }
             return -1;
         }
         vq_desc[1].addr = (uint64_t)(void *)data;
@@ -293,6 +317,9 @@ static int virtio_submit_request(uint32_t type, uint64_t sector,
     virtio_write32(VIRTIO_MMIO_Q_NOTIFY, 0);
 
     if (!virtio_wait_for_completion(target_used)) {
+        if (status_out) {
+            *status_out = VIRTIO_IO_TIMEOUT;
+        }
         return -1;
     }
 
@@ -301,6 +328,9 @@ static int virtio_submit_request(uint32_t type, uint64_t sector,
     vq_used_idx = target_used;
 
     if (ue.id != 0U || req_status != 0U) {
+        if (status_out) {
+            *status_out = (ue.id != 0U) ? VIRTIO_IO_BAD_USED : VIRTIO_IO_STATUS;
+        }
         return -1;
     }
 
@@ -308,22 +338,58 @@ static int virtio_submit_request(uint32_t type, uint64_t sector,
     return 0;
 }
 
-static bool virtio_recover(void) {
-    uart_puts("[virtio-blk] I/O error, resetting\n");
+static bool virtio_recover(virtio_io_status_t st) {
+    if (st == VIRTIO_IO_TIMEOUT) {
+        io_timeout_count++;
+    } else if (st == VIRTIO_IO_BAD_USED) {
+        io_bad_used_count++;
+    } else if (st == VIRTIO_IO_STATUS) {
+        io_status_count++;
+    }
+    io_reset_count++;
+    uart_puts("[virtio-blk] I/O recovery reset reason=");
+    switch (st) {
+        case VIRTIO_IO_TIMEOUT:
+            uart_puts("timeout");
+            break;
+        case VIRTIO_IO_BAD_USED:
+            uart_puts("bad-used");
+            break;
+        case VIRTIO_IO_STATUS:
+            uart_puts("status");
+            break;
+        default:
+            uart_puts("other");
+            break;
+    }
+    uart_puts("\n");
     virtio_blk_init();
     return blk_ready;
 }
 
+static int virtio_submit_with_recovery(uint32_t type, uint64_t sector,
+                                       void *data, uint32_t data_len,
+                                       bool data_is_write) {
+    virtio_io_status_t st = VIRTIO_IO_OK;
+    for (uint32_t attempt = 0; attempt <= VIRTIO_IO_MAX_RETRIES; attempt++) {
+        if (virtio_submit_request(type, sector, data, data_len, data_is_write, &st) == 0) {
+            io_fail_streak = 0U;
+            return 0;
+        }
+        io_fail_streak++;
+        if (st != VIRTIO_IO_TIMEOUT && st != VIRTIO_IO_BAD_USED && st != VIRTIO_IO_STATUS) {
+            return -1;
+        }
+        if (attempt == VIRTIO_IO_MAX_RETRIES || !virtio_recover(st)) {
+            return -1;
+        }
+    }
+    return -1;
+}
+
 static int virtio_rw_raw(uint64_t lba_512, void *buf, uint32_t len, bool write) {
-    if (virtio_submit_request(write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN,
-                              lba_512, buf, len, write) == 0) {
-        return 0;
-    }
-    if (!virtio_recover()) {
-        return -1;
-    }
-    return virtio_submit_request(write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN,
-                                 lba_512, buf, len, write);
+    return virtio_submit_with_recovery(write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN,
+                                       lba_512, buf, len, write);
 }
 
 void virtio_blk_init(void) {
@@ -481,6 +547,11 @@ void virtio_blk_init(void) {
     if (io_timeout_cycles == 0) {
         io_timeout_cycles = 1;
     }
+    io_fail_streak = 0U;
+    io_timeout_count = 0U;
+    io_bad_used_count = 0U;
+    io_status_count = 0U;
+    io_reset_count = 0U;
 
     st |= VIRTIO_STATUS_DRIVEROK;
     virtio_write32(VIRTIO_MMIO_STATUS, st);
@@ -575,11 +646,5 @@ int virtio_blk_flush(void) {
         return 0;
     }
 
-    if (virtio_submit_request(VIRTIO_BLK_T_FLUSH, 0, 0, 0, false) == 0) {
-        return 0;
-    }
-    if (!virtio_recover()) {
-        return -1;
-    }
-    return virtio_submit_request(VIRTIO_BLK_T_FLUSH, 0, 0, 0, false);
+    return virtio_submit_with_recovery(VIRTIO_BLK_T_FLUSH, 0, 0, 0, false);
 }

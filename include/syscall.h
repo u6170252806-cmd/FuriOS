@@ -39,7 +39,16 @@
     X(SYS_READLINK, 32, "readlink", 3) \
     X(SYS_LSTAT, 33, "lstat", 2) \
     X(SYS_MKFSEXT4, 34, "mkfsext4", 3) \
-    X(SYS_FSCKEXT4, 35, "fsckext4", 2)
+    X(SYS_FSCKEXT4, 35, "fsckext4", 2) \
+    X(SYS_LSEEK, 36, "lseek", 3) \
+    X(SYS_FSTAT, 37, "fstat", 2) \
+    X(SYS_STAT, 38, "stat", 2) \
+    X(SYS_CHMOD, 39, "chmod", 2) \
+    X(SYS_FSYNC, 40, "fsync", 1) \
+    X(SYS_MSYNC, 41, "msync", 3) \
+    X(SYS_SIGACTION, 42, "sigaction", 3) \
+    X(SYS_SIGPROCMASK, 43, "sigprocmask", 3) \
+    X(SYS_SIGRETURN, 44, "sigreturn", 0)
 
 enum {
 #define X(sym, nr, name, argc) sym = nr,
@@ -61,10 +70,31 @@ enum {
 #define F_SETFL 4
 
 #define WNOHANG 0x1
+#define WUNTRACED 0x2
+#define WCONTINUED 0x8
 
-#define SIGTERM 15
-#define SIGKILL 9
-#define SIGCHLD 17
+#define SIGHUP   1
+#define SIGINT   2
+#define SIGQUIT  3
+#define SIGKILL  9
+#define SIGTERM  15
+#define SIGCHLD  17
+#define SIGCONT  18
+#define SIGSTOP  19
+
+#define SIG_DFL  0UL
+#define SIG_IGN  1UL
+
+#define SIG_BLOCK   0
+#define SIG_UNBLOCK 1
+#define SIG_SETMASK 2
+
+#define SA_RESTART  0x10000000UL
+#define SA_RESTORER 0x04000000UL
+#define SA_NODEFER  0x40000000UL
+#define SA_RESETHAND 0x80000000UL
+#define SA_NOCLDSTOP 0x00000001UL
+#define SA_NOCLDWAIT 0x00000002UL
 
 #define PROT_NONE  0x0
 #define PROT_READ  0x1
@@ -76,11 +106,19 @@ enum {
 #define MAP_FIXED     0x10
 #define MAP_ANONYMOUS 0x20
 
+#define MS_ASYNC      0x1
+#define MS_INVALIDATE 0x2
+#define MS_SYNC       0x4
+
 #define POLLIN   0x0001
 #define POLLOUT  0x0004
 #define POLLERR  0x0008
 #define POLLHUP  0x0010
 #define POLLNVAL 0x0020
+
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
 
 #define MKFS_EXT4_FEAT_EXTENTS      0x0001U
 #define MKFS_EXT4_FEAT_64BIT        0x0002U
@@ -90,6 +128,7 @@ enum {
 
 #define MKFS_EXT4_OPT_LABEL_SET     0x0001U
 #define MKFS_EXT4_OPT_UUID_SET      0x0002U
+#define MKFS_EXT4_F_STRICT_KERNEL   0x0001U
 
 #define FSCK_EXT4_F_NO_REPAIR       0x0001U
 #define FSCK_EXT4_F_PREEN           0x0002U
@@ -98,6 +137,7 @@ enum {
 #define MKFS_EXT4_PROFILE_DEFAULT    0U
 #define MKFS_EXT4_PROFILE_SMALL      1U
 #define MKFS_EXT4_PROFILE_LARGEFILE  2U
+#define MKFS_EXT4_PROFILE_LARGEFILE4 3U
 
 typedef struct {
     int fd;
@@ -126,5 +166,12 @@ typedef struct {
     uint8_t uuid[16];
     char label[16];
 } fu_mkfs_ext4_opts_t;
+
+typedef struct {
+    uint64_t sa_handler;
+    uint64_t sa_flags;
+    uint64_t sa_restorer;
+    uint64_t sa_mask;
+} fu_sigaction_t;
 
 #endif

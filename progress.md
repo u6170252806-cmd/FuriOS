@@ -1,5 +1,116 @@
 # Progress Log
 
+## 2026-03-04
+
+### Step 41: TinyCC TLS Runtime Bring-up Fixes (real `__thread` execution)
+- Root-cause fix: TLS init-image source in dynamic loader
+  - Fixed `/lib/ld-furios.so` PT_TLS handling to copy TLS initializer bytes from ELF file image (`p_offset`) instead of runtime `p_vaddr`.
+  - This fixes crashes when TLS sections are emitted in a PT_TLS segment that is not part of PT_LOAD mappings.
+  - File:
+    - `user/ld-furios.c`
+
+- Kernel context safety for TLS base register:
+  - Extended trapframe with `tpidr_el0` and updated vector save/restore paths so TP is preserved across exceptions and task switches.
+  - Files:
+    - `include/task.h`
+    - `kernel/vectors.S`
+
+- AArch64 TinyCC backend TLS codegen correctness:
+  - Fixed `arm64_sym_tls()` register-clobber bug when destination register is `x30`.
+  - Previous sequence overwrote the loaded TLS offset with `TPIDR_EL0`, producing invalid `tp + tp` addresses.
+  - File:
+    - `third_party/tinycc/arm64-gen.c`
+
+- Tooling/test coverage improvements:
+  - Added explicit TLS regression flow to `test.sh`:
+    - positive: cross-object `__thread` compile/link/run (`tls-ok`)
+    - negative: block-scope `_Thread_local` must error.
+  - Added strict TLS runtime failure gates (`exec failed: /mnt/tls.elf` and trap pattern).
+  - Expanded `/bin/elfinfo` diagnostics (dynamic tags, TLS symbol dump, RELA dump) for ELF/TLS debugging.
+  - Files:
+    - `test.sh`
+    - `user/elfinfo.c`
+
+- Validation:
+  - `make -j4` PASS.
+  - `./test.sh` PASS.
+
+- External references used for this pass:
+  - GNU assembler AArch64 relocation operators (TLS GOTTPREL forms):
+    - https://sourceware.org/binutils/docs/as/AArch64_002dRelocations.html
+  - GCC TLS model notes (`__thread`, TLS semantics):
+    - https://gcc.gnu.org/onlinedocs/gcc/Thread-Local.html
+  - Arm ABI release index (AAELF64/AArch64 ELF ABI context):
+    - https://github.com/ARM-software/abi-aa/releases
+
+### Step 38: Coherency/Durability/Loader/I-O Hardening Pass
+- Unified page-cache + `mmap` coherency improvements:
+  - Added range invalidation API: `pagecache_invalidate_inode_range(inode, off, len)`.
+  - Wired `msync(..., MS_INVALIDATE)` to invalidate eligible cache lines after range writeback.
+  - Safety rule: pinned pages (active task mappings/refcount > 1) are never dropped from cache metadata.
+- Ext4 JBD2 replay validation tightened:
+  - During replay, journal superblock records now require checksum validity.
+  - Replay now rejects superblock records injected mid-open transaction (`tx_open`/pending updates/revokes).
+- Dynamic loader compatibility uplift (`/lib/ld-furios.so`):
+  - Added `LD_LIBRARY_PATH` search before `/lib` and `/usr/lib` for `DT_NEEDED` resolution.
+  - Expanded auxv capacity and switched to pass-through + override model:
+    - preserves incoming auxv keys by default,
+    - overrides runtime-critical keys (`AT_PHDR/AT_PHNUM/AT_ENTRY/AT_BASE/...`),
+    - sets `AT_EXECFN` to the real target program path.
+- NVMe/AHCI production diagnostics:
+  - Added classified transport error accounting and periodic condensed diagnostics for NVMe submit failures.
+  - Added AHCI per-port error counters (timeout/TFES/busy) and recovery counting diagnostics.
+- Regression coverage:
+  - Added short `msync` test in `test.sh` that validates `MS_SYNC|MS_INVALIDATE` on a shared mapped ext4 file.
+
+### Step 37b: Escape Parser Deadlock Fix (Nano Input Unwedge)
+- Fixed remaining `nano` deadlock case where partial `ESC` sequences could block input forever:
+  - Added timed byte reads for escape-sequence follow-up bytes using `poll` (`read_byte_timeout`).
+  - Lone/incomplete `ESC` now falls back safely instead of waiting forever, so controls like quit continue to work.
+- Added paste-mode fail-safe:
+  - `ESC` during paste now cancels paste mode and restores normal editing path.
+- Restored regular screen refresh in main loop to avoid “looks frozen” behavior while processing long paste streams.
+- Validation:
+  - `make -j4` passed.
+  - `./test.sh` passed end-to-end after parser timeout changes.
+
+### Step 36b: Nano Mid-Paste Stall Root-Cause Hardening
+- Addressed interactive `-nographic` terminal failure mode where editor appeared to “freeze/crash” during paste:
+  - Reworked bracketed paste handling from blocking read loop to non-blocking start/end state machine (`KEY_BRACKETED_PASTE` / `KEY_BRACKETED_PASTE_END`).
+  - Added private CSI consume path (`ESC [ ? ...`) to avoid escape-stream desync.
+  - Reduced paste-path redraw churn by skipping full-screen refresh while paste mode is active.
+- Improved editor behavior/safety:
+  - New files now initialize with one empty row (no confusing `0 line(s)` buffer state).
+  - Save path switched to temp-write + `fsync` + `rename` to avoid truncation/data-loss windows.
+  - Updated key UX to terminal-safe defaults: `Ctrl+O` save, `Ctrl+X` quit (legacy `Ctrl+S`/`Ctrl+Q` aliases still accepted).
+- Hardened launcher TTY behavior in `run.sh`:
+  - Disable `ixon/ixoff` for interactive sessions while QEMU runs.
+  - Restore original TTY settings on exit/signal.
+- Validation:
+  - `make -j4` passed.
+  - `./test.sh` passed (including nano bracketed-paste regression + ext4/tcc matrix).
+
+### Step 35: Nano Paste Crash Hardening + Durability Regression Coverage
+- Hardened `user/nano.c` escape parsing:
+  - Added robust CSI numeric sequence parsing (`ESC [ ...`) instead of fixed 3-byte parsing.
+  - Added explicit bracketed paste detection (`ESC [ 200~` start, `ESC [ 201~` end).
+- Added safe bracketed paste ingest path:
+  - Paste content now inserts as regular text/newlines/tabs and exits cleanly on `201~`.
+  - Prevented raw control-stream leakage into editor buffer during paste bursts.
+- Hardened editor memory/state handling:
+  - Added line/row limits (`NANO_MAX_LINE_CHARS`, `NANO_MAX_ROWS`).
+  - Reworked row insertion to avoid partial-state mutation on allocation failure.
+  - Added reserve overflow bounds and status reporting on allocation/size failures.
+  - Added cursor/viewport clamp guards and safe row draw bounds handling.
+- Improved save durability:
+  - `editor_save()` now calls `fsync(fd)` before close to reduce data-loss windows on crashes/power loss.
+- Added automated regression in `test.sh`:
+  - Opens `nano`, injects bracketed paste stream, saves, exits, and verifies pasted file content.
+  - Keeps runtime short while directly covering the previously failing workflow.
+- Validation:
+  - `make -j4` passed.
+  - `./test.sh` passed end-to-end (ext4 + tcc + nano paste flow + AHCI probe).
+
 ## 2026-03-01
 
 ### Step 1: Project Bootstrap
@@ -1751,3 +1862,936 @@ Additional references used for this step:
   - https://www.qemu.org/docs/master/system/arm/virt.html
 - Linux NVMe command/register definitions (queue create, identify, rw, CAP register layout):
   - https://codebrowser.dev/linux/linux/include/linux/nvme.h.html
+
+### Step 54: NVMe hardening + multi-namespace support + non-512 LBA + mmap/page-cache coherence
+- Hardened NVMe submit/completion and recovery path (`kernel/nvme.c`):
+  - converted to controller+namespace model:
+    - up to `NVME_MAX_CONTROLLERS` controllers,
+    - up to `NVME_MAX_NAMESPACES` namespaces per controller.
+  - interrupt-oriented completion path:
+    - CQ interrupt enable + unmask (`INTMC`),
+    - per-controller IRQ event counters,
+    - submit loop now advances from IRQ events with polling fallback.
+  - timeout/error hardening:
+    - explicit submit result classes (`timeout`, `CFS`, status, CID mismatch),
+    - retry gating on decoded status (`DNR`/SCT-based),
+    - controller recovery/reinit path (disable->rebuild queues->re-identify namespaces).
+  - non-512 LBA namespace support:
+    - keeps 512-byte kernel block interface,
+    - translates to namespace LBA size with per-block read-modify-write for partial writes.
+
+- Expanded NVMe namespace exposure and dev naming:
+  - `dev_kind_t` changed from fixed `DEV_NVME0N1..DEV_NVME7N1` to a range:
+    - `DEV_NVME_BASE .. DEV_NVME_LAST`.
+  - kind decode/encode now maps to `(controller, nsid)` pairs.
+  - `/dev` now supports multi-namespace naming:
+    - `nvme0n1`, `nvme0n2`, ... with partition names `nvme0n1p1`, etc.
+  - touched files:
+    - `include/fs.h`
+    - `kernel/fs.c`
+    - `kernel/block_cache.c`
+    - `include/nvme.h`
+
+- Shared IRQ robustness:
+  - `kernel/trap.c` storage IRQ dispatch changed from single `else-if` chain to fan-out handling.
+  - allows AHCI + NVMe shared INTx delivery on same IRQ line.
+
+- QEMU NVMe topology/runtime expansion (`run.sh`):
+  - `NVME_COUNT` controllers (default `0`, max `8`).
+  - `NVME_NS_PER_CTRL` namespaces per controller (default `1`, max `8`).
+  - `NVME_LBA_SIZE` namespace logical/physical block size (default `512`) for non-512 validation.
+  - per-namespace image naming:
+    - `${NVME_DISK_PREFIX}<ctrl>n<ns>.img`.
+
+- Added short crash/fault recovery suite for ext4 + NVMe:
+  - new script: `stress_nvme.sh`
+  - phase 1:
+    - format, mount, journaled writes, forced timeout kill (simulated crash/power-cut).
+  - phase 2:
+    - reboot on same image, unmount auto-mount, `fsck.ext4 -p`, remount, data/read-write checks, clean unmount.
+  - script result: `[stress-nvme] PASS`.
+
+- Improved mmap/page-cache coherence (`kernel/task.c`):
+  - file-backed `MAP_PRIVATE` fault path now sources data from page cache (`pagecache_get_or_create`) instead of direct `inode->data`.
+  - removed stale `inode->data` dependency from shared-map writeback guard.
+  - effect:
+    - works for ext4-backed file mappings,
+    - better coherence between file I/O and mmap-backed pages.
+
+- Verification (single-pass, short targeted):
+  - `make -j4` PASS.
+  - NVMe-only boot PASS (`/dev/nvme0n1`).
+  - multi-namespace PASS:
+    - `NVME_COUNT=1 NVME_NS_PER_CTRL=2` -> `/dev/nvme0n1`, `/dev/nvme0n2`.
+  - non-512 LBA PASS:
+    - `NVME_LBA_SIZE=4096`,
+    - `mkfs.ext4 /dev/nvme0n1`, mount, list directory -> PASS.
+  - mixed AHCI+NVMe shared-IRQ boot PASS.
+  - crash/recovery script PASS (`./stress_nvme.sh`).
+
+Additional references used for this step:
+- QEMU NVMe controller/namespace topology:
+  - https://www.qemu.org/docs/master/system/devices/nvme.html
+- Linux NVMe structures/status model:
+  - https://codebrowser.dev/linux/linux/include/linux/nvme.h.html
+- NVMe base specification source:
+  - https://nvmexpress.org/developers/nvme-specification/
+
+### Step 55: Unified file cache write path + timer writeback + JBD2 ring/maintenance hardening + mkfs/fsck policy upgrades
+- Unified regular-file I/O through page cache (`kernel/pagecache.c`, `kernel/fs.c`):
+  - added cache-native APIs:
+    - `pagecache_read`, `pagecache_write`
+    - `pagecache_mark_dirty`
+    - `pagecache_flush_inode`, `pagecache_flush_all`
+    - `pagecache_tick` (bounded periodic writeback).
+  - `fs_read/fs_write` for regular files now route through cache for both memfs/ext4.
+  - cache entries now track:
+    - `dirty` state,
+    - LRU-ish `last_touch`,
+    - eviction with writeback of dirty victims.
+  - delayed writeback now persists through cache backend:
+    - memfs -> inode data copy,
+    - ext4 -> `ext4_tx_begin` + `ext4_write` + `ext4_tx_commit`.
+
+- mmap coherence/writeback integration:
+  - shared writable file mappings now mark cache pages dirty on map fault.
+  - shared-page unmap path (`pagecache_writeback`) now marks cache-dirty rather than forcing immediate synchronous write.
+  - keeps file read/write/mmap data path coherent on one cache object.
+
+- Writeback daemon behavior:
+  - timer IRQ now drives:
+    - `pagecache_tick(now_ticks)` for bounded background dirty flush,
+    - `ext4_periodic_maintenance(now_ticks)` for periodic JBD2 checkpoint progress.
+  - files:
+    - `kernel/trap.c`
+    - `include/pagecache.h`
+    - `include/ext4.h`
+    - `kernel/ext4.c`
+
+- JBD2 hardening:
+  - stricter ring reservation safety:
+    - reserve fails if resulting head does not advance (prevents full-ring ambiguity).
+  - pending-queue pressure handling:
+    - `ext4_jbd2_tx_commit` now attempts checkpoint drain when pending queue is full before failing.
+  - periodic checkpoint hook exported:
+    - `ext4_periodic_maintenance()` triggers batched checkpointing when aged/backlogged.
+
+- mkfs policy completion (`user/mkfs.ext4.c`, `kernel/fs.c`, `include/syscall.h`):
+  - added strict mode flag:
+    - `MKFS_EXT4_F_STRICT_KERNEL`
+    - userspace option: `-K` / `--strict-kernel`.
+  - strict mode enforces kernel RW-supported feature subset only.
+  - validated feature mask in kernel mkfs path (rejects unknown bits).
+  - expanded `-T` presets with:
+    - `largefile4` (`MKFS_EXT4_PROFILE_LARGEFILE4`, 4MiB bytes-per-inode policy).
+  - added feature preset tokens in `-O`:
+    - `baseline`, `kernelrw`, `modern`.
+  - default mkfs userspace feature set now includes `64bit`.
+
+- fsck policy/repair tuning (`kernel/fs.c`):
+  - explicit repair policy levels:
+    - `-n` => none,
+    - `-p` => safe auto-fix,
+    - `-y` => force/high-risk auto-fix.
+  - duplicate/out-of-range/unallocated inode data block issues:
+    - `-p` now rejects with explicit `requires -y` class where needed.
+    - `-y` can salvage corrupted regular-file payload by clearing inode data mapping payload and keeping inode reachable.
+  - retained existing safe repairs (checksums/counters/link-count rebuild/orphan-head cleanup) for `-p/-y`.
+
+- Additional safety glue:
+  - `pagecache_flush_all()` now required before mkfs/fsck and before unmount.
+  - truncate paths flush inode cache before applying truncate metadata changes.
+
+- Verification:
+  - `make -j4` PASS.
+  - `./test.sh` PASS (single full pass).
+  - short targeted runtime smoke:
+    - `umount /mnt`
+    - `mkfs.ext4 -K -O modern /dev/sda` => fail (expected strict-mode rejection).
+    - `mkfs.ext4 -K -O kernelrw /dev/sda` => format success.
+    - `fsck.ext4 -p /dev/sda` => clean.
+
+Additional references used for this step:
+- ext4 journaling/JBD2 behavior:
+  - https://www.kernel.org/doc/html/latest/filesystems/ext4/journal.html
+- ext4 superblock feature classes:
+  - https://www.kernel.org/doc/html/latest/filesystems/ext4/super.html
+- e2fsck option behavior (`-p`, `-y`, `-n`) model:
+  - https://www.man7.org/linux/man-pages/man8/e2fsck.8.html
+
+## 2026-03-03 - TinyCC /bin/tcc integration (FuriOS userspace)
+
+- Implemented a real `/bin/tcc` command using TinyCC source (`third_party/tinycc`) instead of the previous placeholder stub.
+- Added FuriOS TinyCC port wiring:
+  - `user/tcc.c`: self-contained TinyCC runtime shim (syscall I/O, stdio subset, allocator, formatting, time/math stubs) + embedded TinyCC one-source build.
+  - `user/tcc_compat.h`: minimal hosted C API surface expected by TinyCC.
+  - `third_party/tinycc/config.h`: FuriOS target config (AArch64 ELF, semlock off, static mode).
+  - `third_party/tinycc/tcc.h`: FuriOS compatibility include path + native-run detection disabled for this environment.
+  - `third_party/tinycc/libtcc.c`: `FUROS_TCC_NO_RUN` gate to exclude `tccrun.c` path.
+  - `third_party/tinycc/tccpp.c`: defensive pointer-sanity guard in token hash traversal for stability in this freestanding port.
+  - `third_party/tinycc/tccdefs_.h`: minimal embedded predefs set for this environment.
+- Build integration:
+  - `Makefile`: `tcc` now links with a dedicated self-contained rule (no shared user libc objects), still embedded as `/bin/tcc`.
+  - Added local compatibility headers required by TinyCC in freestanding build (`user/inttypes.h`, `user/assert.h`).
+
+### Runtime validation (short smoke)
+- `tcc -v` works and reports version.
+- `tcc -E /mnt/hi.c` works (preprocess output produced).
+- `tcc -c /mnt/hi.c -o /mnt/hi.o` works (object file generated on ext4).
+
+### Current limitation
+- Full executable link path (`tcc file.c -o out`) is not fully wired to FuriOS crt/lib objects yet, so default TinyCC link mode can still require runtime crt artifacts not present as normal files.
+- Practical current workflow in-OS: compile to object (`-c`) and preprocess (`-E`) reliably.
+
+### Debug hardening note
+- Added ELR printing in sync trap logs (`kernel/trap.c`) to speed up future userspace fault localization during toolchain bring-up.
+
+## 2026-03-03 - TinyCC default final-link mode wired (`tcc file.c -o out`)
+
+- Implemented full default TinyCC link prerequisites inside FuriOS filesystem as normal files under `/lib`:
+  - `/lib/crt1.o`
+  - `/lib/crti.o`
+  - `/lib/crtn.o`
+  - `/lib/libc.a`
+  - `/lib/libtcc1.a`
+
+### Build/system integration
+- Added a dedicated `tccrt` build pipeline in `Makefile`:
+  - builds startup objects from `user/tccrt/{crt1.S,crti.S,crtn.S}`
+  - builds `libc.a` from existing user runtime objects (`syscall.o`, `string.o`, `io.o`, `alloc.o`)
+  - stages `libtcc1.a` from toolchain libgcc for compiler runtime helpers.
+- Embedded all `tccrt` artifacts into kernel image and exposed them in memfs at boot (`kernel/fs.c`).
+
+### Validation (single short pass)
+- Booted QEMU and verified:
+  - `ls /lib` shows all required crt/lib files.
+  - `tcc /mnt/hi.c -o /mnt/hi.elf` now succeeds (previously failed on missing `crt1.o`/`crti.o`).
+  - output ELF file is created on disk (`/mnt/hi.elf`).
+
+### Note
+- This step resolves default link-time artifact failures.
+- Executing newly linked files from writable ext4 paths still depends on executable-mode handling policy in current kernel process-exec path.
+
+## 2026-03-03 - Exec permission flow + SDK/sysroot + TinyCC tooling hardening
+
+- Implemented executable permission flow end-to-end:
+  - Added new syscall `SYS_CHMOD` and userspace wrapper `sys_chmod`.
+  - Added `/bin/chmod` command (octal mode syntax).
+  - Added kernel `fs_chmod()` with ext4-backed mode updates via transaction commit.
+  - Added ext4 mode mutation path `ext4_chmod()` (preserves inode file type bits, updates cached writable/exec state).
+  - `sys_exec` now enforces execute bit from file mode (`st_mode & 0111`) rather than legacy executable flag only.
+  - `sys_exec` now supports exec for files without in-memory blob backing by loading executable bytes via `fs_read()` into temporary kernel pages before `task_exec`.
+
+- Implemented userspace SDK/sysroot layout:
+  - Added `/usr/include` and `/usr/lib` population at boot.
+  - Added compatibility `/include` headers for TinyCC default include path.
+  - Installed SDK headers:
+    - `stddef.h`, `stdint.h`, `stdbool.h`, `stdarg.h`
+    - `furios.h`, `unistd.h`, `fcntl.h`, `string.h`, `stdio.h`, `stdlib.h`
+    - `sys/stat.h` under `/usr/include/sys`
+  - Mirrored runtime libs/startup objects under `/usr/lib`:
+    - `crt1.o`, `crti.o`, `crtn.o`, `crtbegin.o`, `crtend.o`, `libc.a`, `libtcc1.a`
+
+- Completed TinyCC linker/runtime compatibility wiring:
+  - Added `crtbegin.o` / `crtend.o` artifacts to build, embed, and filesystem.
+  - Updated TinyCC ELF path to include `crtbegin.o`/`crtend.o` for FuriOS.
+  - Reworked FuriOS `crt1.S` to invoke init/fini arrays around `main` and return via syscall exit.
+  - Added FuriOS-local `crtbegin.S` / `crtend.S` marker objects to avoid host toolchain frame-registration side effects.
+
+- Added toolchain companion commands:
+  - `/bin/ar` (execs `tcc -ar ...`)
+  - `/bin/ranlib` (execs `tcc -ar s <archive>`)
+  - `/bin/as` (execs `tcc -c ...` assembler frontend behavior)
+
+- Diagnostics improvement:
+  - Enabled TinyCC DWARF generation (`CONFIG_DWARF_VERSION=2`) so `-g` emits line/symbol info instead of being disabled.
+
+### Validation (single short pass)
+- `make -j4` PASS.
+- QEMU short smoke PASS:
+  - `/bin` now contains `chmod`, `ar`, `ranlib`, `as`.
+  - `/usr/include` and `/usr/lib` populated as expected.
+  - `tcc /mnt/m.c -o /mnt/m.elf` creates ELF.
+  - `/mnt/m.elf` fails before chmod and succeeds after `chmod 755 /mnt/m.elf`.
+- `tcc -c`, `ar rcs`, and `ranlib` work on `/mnt` artifacts.
+
+## 2026-03-03 - Hardening pass (page cache + JBD2 + NVMe + process/signal + VM)
+
+- Unified page-cache coherence tightened:
+  - `pagecache_writeback()` now extends inode size for shared-mmap writeback beyond prior EOF.
+  - `pagecache_notify_write()` now also grows inode size for coherent metadata/data visibility.
+  - Added adaptive background writeback budget (`dirty_count`-based) in `pagecache_tick()` to reduce dirty-page buildup under sustained write/mmap pressure.
+  - `inode_free()` now invalidates file page-cache entries before inode reuse to prevent stale page aliasing after unlink/recreate cycles.
+  - `mprotect(PROT_WRITE)` on shared file mappings now marks relevant cache page dirty.
+
+- JBD2 durability/space-accounting hardening:
+  - `ext4_jbd2_tx_commit()` now retries ring reservation with bounded checkpoint advancement when log space is temporarily constrained.
+  - This avoids immediate commit failure when head/tail pressure can be relieved by checkpoint progress.
+
+- NVMe production hardening:
+  - Added per-controller failure streak + adaptive timeout backoff.
+  - Added throttled recovery entry (`nvme_recover_throttled`) to avoid reset storms.
+  - `nvme_submit_with_retry()` now classifies retryable outcomes and performs bounded recover/retry with backoff.
+  - `nvme_poll()` now uses the same backoff/throttled recovery path on controller fatal status.
+
+- AHCI recovery hardening:
+  - Added final fallback path in `ahci_cmd_with_retry()`:
+    - full HBA reset,
+    - per-disk port rebase,
+    - COMRESET on target port,
+    - final command retry.
+  - This improves resilience under repeated TFES/timeout storms where port-local recovery is insufficient.
+
+- Process/signal model completion step:
+  - Added wait options `WUNTRACED` and `WCONTINUED`.
+  - Added signal constants and support for `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGSTOP`, `SIGCONT` (plus existing TERM/KILL).
+  - Added stop/continue child event reporting via `waitpid`:
+    - stopped status (`0x7f` form) when `WUNTRACED`.
+    - continued status (`0xffff`) when `WCONTINUED`.
+  - Added stopped task state (`TASK_STOPPED`) and stop/continue event flags.
+  - Extended `/bin/kill` user tool options to cover `-1/-2/-3/-18/-19` aliases.
+
+- VM/context-switch hardening:
+  - Added TTBR0 fast-path in `mmu_switch_ttbr0()` to skip redundant TTBR writes when ASID+TTBR0 are unchanged on reschedule.
+
+### Validation (single short pass)
+- `make -j4` PASS.
+- Short non-interactive QEMU smoke PASS:
+  - boot to shell,
+  - `/dev` listing sane,
+  - new signal options in `kill` accepted and routed (invalid pid path returns expected failure),
+  - shell remains responsive (`echo smoke-ok`).
+
+## 2026-03-03 - SDK/libc/syscall surface expansion + TinyCC hardening pass
+
+- Expanded SDK/sysroot headers generated at boot (`kernel/fs.c`):
+  - Added/expanded: `errno.h`, `signal.h`, `poll.h`, `limits.h`, `assert.h`, `inttypes.h`, `time.h`.
+  - Added/expanded sys headers: `sys/types.h`, `sys/wait.h`, `sys/mman.h`, richer `sys/stat.h` mode/type macros.
+  - Expanded `furios.h` prototypes/macros for process, fs, poll/fcntl, mmap/brk paths.
+  - Expanded `stdio.h`, `string.h`, `stdlib.h` declarations for TinyCC-compiled programs.
+  - Installed TinyCC runtime predefs header (`tccdefs.h`) into both `/include` and `/usr/include`.
+
+- Extended user libc archive used by TinyCC runtime (`libc.a`):
+  - Added `user/lib/posix.c` with errno-setting POSIX-style wrappers.
+  - Added `user/lib/stdio.c` (`printf`/`snprintf`/`vsnprintf`/`vprintf`/`putchar`/`getchar`/`__assert_fail`).
+  - Updated `Makefile` so these objects are linked into userspace and archived for tcc runtime linking.
+
+- TinyCC stability hardening:
+  - Switched TinyCC to runtime predefs loading (`CONFIG_TCC_PREDEFS=0`) to avoid truncated built-in predefs.
+  - Added defensive pointer guards in TinyCC preprocessor/debug code paths for FuriOS build (`tccpp.c`, `tccdbg.c`) to avoid hard crashes on bad internal pointers.
+  - Disabled `-g` debug emission in FuriOS TinyCC path with explicit warning message instead of crashing (`libtcc.c`).
+    - Current behavior: `-g` accepted but downgraded with warning: debug info temporarily unavailable.
+
+- Runtime diagnostics improvements:
+  - Added per-task command-name tracking (`task.comm`) and propagated it across exec/fork/init.
+  - Trap log now includes `pid` + task `comm` in sync fault reports.
+
+- Tool wrappers polish:
+  - `ranlib` now supports multiple archives in one invocation.
+  - `as` wrapper improved to avoid forcing `-c` for non-compile modes.
+  - TinyCC library default search paths tightened (`/lib:/usr/lib`; removed `/bin:/sbin` from libpath scan).
+
+- Test harness updates (`test.sh`):
+  - Added TCC workflow coverage for:
+    - compile/object/archive/ranlib,
+    - dependency output generation (`-MD -MF`),
+    - default link+exec from ext4,
+    - constructor/destructor and runtime syscall/mmap/pipes smoke.
+  - Shortened/split long shell-emitted source lines to avoid parser truncation artifacts.
+  - Updated assertions to fail fast on toolchain runtime-flow regressions.
+
+### Validation (single full suite pass)
+- `make -j4` PASS.
+- `./test.sh` PASS end-to-end (virtio smoke + ext4 flow + toolchain/runtime smoke + AHCI probe flow).
+
+### Current known limitation
+- TinyCC `-g` debug-info emission is intentionally disabled on FuriOS (warning-only) to keep compiler runtime stable while DWARF path is completed.
+
+## 2026-03-03 - `/bin/nano` editor integration + TinyCC long-flow compile stability fix
+
+- Added a real interactive text editor in userspace:
+  - New `user/nano.c` (full-screen terminal editor).
+  - Features included:
+    - file open/save,
+    - cursor movement (arrows/home/end/page up/page down),
+    - insert/delete/backspace/newline editing,
+    - status/message bar,
+    - unsaved-change quit guard,
+    - in-file search prompt (`Ctrl+F`),
+    - help/status shortcuts (`Ctrl+G`, `Ctrl+S`, `Ctrl+Q`).
+  - Wired into build and root FS:
+    - `Makefile`: added `nano` to `USER_PROGS`.
+    - `kernel/fs.c`: added embed externs + `/bin/nano` install entry.
+
+- TinyCC hardening follow-up for long command/test flows:
+  - Root-cause symptom: intermittent `tccdefs.h` parse failures under long toolchain test sequence.
+  - Stabilization changes:
+    - Switched TinyCC back to embedded predefs mode (`third_party/tinycc/config.h` -> `CONFIG_TCC_PREDEFS=1`) to avoid runtime dependence on `/include/tccdefs.h` during compile path.
+    - Extended `third_party/tinycc/tccdefs_.h` with AArch64 `__builtin_va_list` definition and basic va-copy/end helpers so `<stdarg.h>`-dependent code compiles in runtime tests.
+    - Kept compile-path guard logic in `third_party/tinycc/tccpp.c` for runtime predefs branch as defensive fallback.
+
+### Validation (single full suite pass)
+- `make -j4` PASS.
+- `./test.sh` PASS end-to-end, including:
+  - ext4 mount/mutate/re-mount flow,
+  - mkfs/fsck flow,
+  - TinyCC compile/archive/link/runtime smoke (`tcc`, `ar`, `ranlib`, constructor/destructor, mmap/pipe/fork runtime path),
+  - AHCI probe/smoke phase.
+
+## 2026-03-03 - Fix for intermittent empty file after `nano` save/reboot
+
+- Core issue fixed:
+  - Dirty file-page cache was not force-flushed on writable `close()`.
+  - Result: after truncate+write workloads (e.g. editor saves), abrupt QEMU termination could leave recently written content missing after reboot.
+
+- Kernel fix:
+  - `kernel/task.c`
+    - Added writable-inode close detection (`task_fd_needs_writeback`).
+    - `task_fd_close()` now flushes file page-cache (`pagecache_flush_inode`) before dropping FD state for writable regular files.
+    - `task_fd_close()` now returns status; writable close flush failures propagate as `-1`.
+  - `kernel/syscall.c`
+    - `sys_close` now returns actual close/writeback status instead of always returning success.
+
+- Userspace robustness fix:
+  - `user/nano.c`
+    - Added `write_all()` helper and switched save path to full-write loops (handles short writes safely instead of assuming one write completes the full buffer).
+
+### Focused validation
+- Reproduced crash-like flow with two boots on the same AHCI ext4 image:
+  1. boot #1: write `/mnt/hi.txt`, then forced QEMU stop (timeout/signal),
+  2. boot #2: read `/mnt/hi.txt`.
+- Result after fix: saved content persisted and was readable on reboot.
+
+### Regression validation
+- `make -j4` PASS.
+- `./test.sh` PASS.
+
+## 2026-03-04 - Real `/lib/ld-furios.so` dynamic loader + exec/runtime hardening pass
+
+- Implemented a real userspace ELF dynamic loader at `/lib/ld-furios.so`:
+  - New loader binary source: `user/ld-furios.c`.
+  - New high-address linker script: `user/ld-furios.ld` (loader linked at `0x00680000`).
+  - Build wiring:
+    - `Makefile` now builds/embeds `build/user/ld-furios.elf`.
+    - `kernel/fs.c` now installs it as executable `/lib/ld-furios.so`.
+
+- Loader capabilities implemented:
+  - Loads target ELF image from disk (`ET_EXEC` and `ET_DYN`).
+  - Maps all `PT_LOAD` segments with correct final page protections.
+  - Parses `PT_DYNAMIC` and applies `RELA` relocations:
+    - `R_AARCH64_RELATIVE`
+    - `R_AARCH64_ABS64`
+    - `R_AARCH64_GLOB_DAT`
+    - `R_AARCH64_JUMP_SLOT`
+  - Preserves runtime constructor/destructor semantics by jumping to target entry
+    (`_start`) without pre-running init arrays in the loader.
+  - Applies `PT_GNU_RELRO` final read-only protection.
+  - Jumps into target entry with argv passed by kernel `PT_INTERP` handoff path.
+
+- Kernel-side mapping policy adjustment for loader compatibility:
+  - `kernel/task.c` (`task_mmap`):
+    - `MAP_FIXED` mappings are now allowed anywhere in user VA (`>= USER_VA_BASE`, below stack floor), not only above current heap break.
+    - This allows high-linked loader code to map target `ET_EXEC` images at canonical low VAs (e.g. `0x00400000`).
+
+- Cleanup:
+  - Removed stale syscall write debug scaffolding (`DEBUG_WRITE_FAIL`) and `print.h` dependency from `kernel/syscall.c`.
+
+### Validation (single pass policy)
+- Targeted smoke:
+  - `/lib/ld-furios.so` present in `/lib`.
+  - `tcc /mnt/h.c -o /mnt/h.elf` then `/mnt/h.elf` executed successfully and printed expected output.
+- Full suite:
+  - `make -j4` PASS.
+  - `./test.sh` PASS end-to-end, including the TCC runtime execution flow (`hello.elf`, `tccmulti.elf`, `ctor.elf`, `rt.elf`).
+
+### Source checks consulted while implementing loader relocation semantics
+- GNU C Library AArch64 runtime relocation handling (`elf_machine_rela`):
+  - https://codebrowser.dev/glibc/glibc/sysdeps/aarch64/dl-machine.h.html
+- TinyCC FuriOS config default interpreter path (`/lib/ld-furios.so`):
+  - `third_party/tinycc/config.h` (in-tree)
+
+## 2026-03-04 - Loader dependency-ordering + auxv/envp ABI pass + relocation/hash compatibility hardening
+
+- Dynamic loader dependency graph ordering (`user/ld-furios.c`):
+  - Increased DSO capacity (`MAX_DSO=32`) and added explicit per-object dependency index list.
+  - Added dependency resolution pass from `DT_NEEDED` names to loaded object indexes.
+  - Replaced load-order constructor calls with dependency-safe DFS order:
+    - init: dependencies first,
+    - fini: reverse of resolved init order.
+  - This removes the prior ordering hazard where `libA` could initialize before `libC` even when `libA` depends on `libC`.
+
+- ELF dynamic/relocation compatibility upgrades:
+  - Added dynamic tags/constants:
+    - `DT_GNU_HASH`, `DT_RUNPATH`, `DT_FLAGS`,
+    - extra AArch64 relocations (`ABS32/ABS16/PREL64/PREL32/PREL16`).
+  - Added `DT_GNU_HASH` symbol-count derivation fallback when classic `DT_HASH` is absent.
+  - Extended loader relocation support with:
+    - `R_AARCH64_IRELATIVE`,
+    - `R_AARCH64_ABS32`,
+    - `R_AARCH64_ABS16`,
+    - `R_AARCH64_PREL64`,
+    - `R_AARCH64_PREL32`,
+    - `R_AARCH64_PREL16`.
+  - Hardened malformed `DT_NEEDED` handling (now rejects overflow instead of silently truncating).
+
+- Runtime ABI parity (`envp` + `auxv`) improvements:
+  - Loader `main` now accepts `envp` and passes it to the target entry (`x2`).
+  - Loader now rebuilds auxv with required entries and incoming-policy passthrough:
+    - core: `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_BASE`, `AT_ENTRY`, `AT_UID`, `AT_EUID`, `AT_GID`, `AT_EGID`, `AT_SECURE`, `AT_EXECFN`,
+    - passthrough when present: `AT_HWCAP`, `AT_CLKTCK`, `AT_RANDOM`.
+  - `AT_BASE` now uses incoming value when available, otherwise a loader-address fallback.
+  - Added bounded auxv push helper with overflow fail-fast.
+
+- TinyCC runtime startup ABI fix (`user/tccrt/crt1.S`):
+  - Preserved incoming `x2/x3` across constructor execution and restored before `main`.
+  - Fixes loss of `envp/auxv` in programs compiled with embedded TinyCC CRT.
+
+- Minor loader robustness:
+  - Fixed memory leak in file-image load path on read failure.
+
+- Test-suite expansion (`test.sh`):
+  - Added a short TCC runtime auxv/envp probe (`/mnt/auxv.elf`) validating:
+    - `envp` terminator handling,
+    - auxv visibility for `AT_PHNUM`, `AT_PAGESZ`, `AT_ENTRY`, `AT_EXECFN`, `AT_BASE`.
+  - Added explicit regression gate for `exec failed: /mnt/auxv.elf`.
+
+### Validation (single full suite pass)
+- `make -j4` PASS.
+- `./test.sh` PASS end-to-end (virtio/ext4/toolchain/runtime + AHCI phase), including new auxv/envp runtime check.
+
+### Source checks consulted in this pass
+- ELF gABI dynamic section semantics (`DT_NEEDED`, init/fini arrays, relocation model):
+  - https://refspecs.linuxfoundation.org/elf/gabi4%2B/contents.html
+- Linux auxv/`AT_*` contract:
+  - https://man7.org/linux/man-pages/man3/getauxval.3.html
+- AArch64 relocation behavior reference implementation in glibc dynamic loader:
+  - https://codebrowser.dev/glibc/glibc/sysdeps/aarch64/dl-machine.h.html
+
+## 2026-03-04 - Journal/cache/I-O hardening pass (durability + coherence + recovery)
+
+- Syscall durability surface completed:
+  - Added syscall numbers and full wiring for:
+    - `SYS_FSYNC` (fd-based file sync)
+    - `SYS_MSYNC` (mapped range sync)
+  - Files:
+    - `include/syscall.h`
+    - `kernel/syscall.c`
+    - `kernel/task.c`
+    - `kernel/fs.c`
+    - `user/lib/syscall.c`
+    - `user/lib/posix.c`
+    - `user/user.h`
+  - SDK exposure for toolchain-built userland:
+    - `kernel/fs.c` generated headers now expose `sys_fsync/sys_msync`, `fsync/msync`, and `MS_*` flags in `/usr/include`.
+
+- Single-cache coherence + dirty/writeback tuning:
+  - Implemented `pagecache_flush_inode_range()` for precise mapped-range flushes used by `msync`.
+  - Added bounded writeback failure backoff state in page cache:
+    - writeback fail streak tracking,
+    - temporary throttling window before next background/pressure writeback cycle.
+  - Integrated backoff into both pressure-triggered writeback and periodic writeback tick.
+  - Files:
+    - `kernel/pagecache.c`
+    - `include/pagecache.h`
+
+- Filesystem durability entry points:
+  - Implemented:
+    - `fs_sync_inode(inode_t *)`
+    - `fs_sync_all(void)`
+  - Behavior:
+    - flush pagecache dirty data,
+    - flush ext4 journal/checkpoint state,
+    - flush block cache for block devices/global sync.
+  - Files:
+    - `kernel/fs.c`
+    - `include/fs.h`
+
+- ext4/JBD2 lifecycle hardening:
+  - Added exported `ext4_sync_filesystem()` and used it from unmount path.
+  - Replay validation tightened:
+    - explicit guard-exhaustion failure instead of silent acceptance.
+  - Ring reserve hardening:
+    - extra full-ring/head-tail safety checks in reserve path.
+  - Checkpoint batching behavior strengthened:
+    - removed commit-time immediate checkpointing from tx commit fast path;
+      checkpointing now batches via periodic maintenance / explicit sync.
+  - Files:
+    - `kernel/ext4.c`
+    - `include/ext4.h`
+
+- Interrupt/recovery path improvement for virtio-blk:
+  - Added classified I/O completion failure reasons:
+    - timeout / bad-used-ring / device-status / not-ready.
+  - Added bounded retry + reset recovery loop for request submission.
+  - Added per-class counters and explicit recovery reason logging.
+  - Files:
+    - `kernel/virtio_blk.c`
+
+- Short stress harness:
+  - Added `stress_io_short.sh` wrapper to run reduced-duration AHCI fault-injection and NVMe crash/replay checks.
+  - File:
+    - `stress_io_short.sh`
+
+### Validation
+- `make -j4` PASS.
+- `./test.sh` PASS.
+
+## 2026-03-04 - TLS/loader ABI + trap symbolization + W^X hardening pass
+
+### What I changed
+
+- Added ELF symbol metadata in kernel task model for trap-time symbolization:
+  - New per-task debug symbol table (`task_debug_sym_t`) populated from ELF `SHT_SYMTAB`/`SHT_DYNSYM` function symbols.
+  - Added `task_symbolize_pc(...)` and wired trap logs to print best-match symbol + offset/size.
+  - Added `task_load_debug_symbols(...)` API and used it in `exec` interpreter path so PT_INTERP-launched targets (via `/lib/ld-furios.so`) still produce target-symbol trap output.
+  - Files:
+    - `include/task.h`
+    - `kernel/task.c`
+    - `kernel/trap.c`
+    - `kernel/syscall.c`
+
+- Loader W^X/RELRO tightening:
+  - Loader segment mapping now uses non-executable writable staging (`PROT_READ|PROT_WRITE`) before final `mprotect`.
+  - Final segment protection drops write on executable segments (W^X discipline).
+  - `PT_GNU_RELRO` apply is now fail-checked (hard error if `mprotect` fails).
+  - File:
+    - `user/ld-furios.c`
+
+- ABI/auxv parity expansion in kernel exec stack setup:
+  - Added `AT_RANDOM` user pointer and random seed blob on initial stack.
+  - Added `AT_CLKTCK` (`TIMER_HZ`) and `AT_HWCAP`/`AT_HWCAP2` entries.
+  - Increased local auxv frame capacity accordingly.
+  - File:
+    - `kernel/task.c`
+
+- ELF header support additions used by symbolizer/ABI updates:
+  - Added `Elf64_Shdr` and section-type constants to shared ELF header.
+  - Added `AT_HWCAP2` constant.
+  - File:
+    - `include/elf.h`
+
+- Toolchain/runtime regression coverage (`test.sh`) extended:
+  - Added multi-DSO TLS stress:
+    - two shared libraries with independent TLS and cross-DSO `extern __thread` access,
+    - main binary linked via `-L/-l` verifies correct TLS behavior (`tls-dso-ok`).
+  - Extended auxv smoke to verify `AT_CLKTCK` and `AT_RANDOM`.
+  - Added trap-debug smoke:
+    - compile `-g` crashing binary,
+    - assert trap log includes `comm=trapdbg.elf` and `sym=crash_here+...`.
+  - Added execution-failure guard for `/mnt/tlsdso.elf`.
+  - File:
+    - `test.sh`
+
+### Validation
+- `make -j4` PASS.
+- `./test.sh` PASS.
+
+## Step 41 (Single-cache block path + ext4 source pinning + loader v2 ABI hardening)
+
+### What I changed
+
+- Unified block-device file I/O to the shared block cache path:
+  - `/dev/*` block inode read/write now uses `block_cache_read/write/flush` instead of direct backend calls.
+  - `dev_block_read_inode()` and `dev_block_write_inode()` now attach cache context via `block_cache_attach_inode(inode)` and do all sector access through cache lines.
+  - Removed now-dead direct multi-sector/flush helpers.
+  - File:
+    - `kernel/fs.c`
+
+- Pinned ext4 to its mounted source device context:
+  - `ext4_mount()` now accepts and stores the mount source block inode info (`dev_kind`, partition LBA base/count).
+  - Added `ext4_attach_source_dev()` and call it before every ext4 raw byte read/write path.
+  - This prevents cross-device cache-context drift when multiple block devices are active.
+  - Files:
+    - `include/ext4.h`
+    - `kernel/fs.c`
+    - `kernel/ext4.c`
+
+- Tightened JBD2 ring head/tail accounting:
+  - Added explicit ring-free computation helper (`ext4_jbd2_ring_free_blocks()`).
+  - Reservation now checks required blocks against computed free ring space directly.
+  - ENOSPC logging now includes computed free space to improve failure diagnosis.
+  - File:
+    - `kernel/ext4.c`
+
+- Loader/ELF tier-2 compatibility hardening (`/lib/ld-furios.so`):
+  - Added dynamic version-table tags in ELF parsing:
+    - `DT_VERSYM`, `DT_VERDEF`, `DT_VERDEFNUM`, `DT_VERNEED`, `DT_VERNEEDNUM`.
+  - Added version-aware symbol resolution:
+    - requester required-version lookup from `VERNEED`,
+    - provider version-name lookup from `VERDEF`,
+    - hidden-version visibility filtering.
+  - Added TLS relocation coverage:
+    - `R_AARCH64_TLS_DTPMOD64`
+    - `R_AARCH64_TLS_DTPREL64`
+    - `R_AARCH64_TLS_TPREL64`
+    - `R_AARCH64_TLSDESC`
+  - Added a minimal static TLS runtime layout for loaded DSOs:
+    - per-DSO module IDs and TLS offsets,
+    - TLS image allocation/copy,
+    - `TPIDR_EL0` setup in loader.
+  - Files:
+    - `include/elf.h`
+    - `user/ld-furios.c`
+
+- Added short ext4 replay durability gate to tests:
+  - Added two-boot crash-style replay validation in `test.sh`:
+    - boot #1 writes replay file and exits under timeout (unclean),
+    - boot #2 verifies replayed content.
+  - File:
+    - `test.sh`
+
+### Validation
+- `make -j4` PASS.
+- `./test.sh` PASS.
+
+### External references used for this hardening pass
+- Linux ext4/JBD2 journal format and replay model:
+  - https://www.kernel.org/doc/html/latest/filesystems/ext4/journal.html
+- glibc AArch64 dynamic relocation handling (`R_AARCH64_TLS_*`, `TLSDESC`, versioned symbol lookup patterns):
+  - https://codebrowser.dev/glibc/glibc/sysdeps/aarch64/dl-machine.h.html
+- Linux UAPI ELF dynamic/version tag definitions:
+  - https://codebrowser.dev/linux/linux/include/uapi/linux/elf.h.html
+
+## Step 40 (Signal model hardening: pending queue + fork/exec semantics + restart policy)
+
+### What I changed
+
+- Kernel signal pending model strengthened:
+  - Replaced pure bitmask-only pending behavior with ordered pending queue storage (`TASK_SIGNAL_QUEUE_LEN`),
+    while keeping standard-signal coalescing (no duplicate pending instances of the same signal).
+  - Added queue helpers for enqueue/remove/clear to keep bitmask and queue state consistent.
+  - Updated `SIGCHLD` notification path to use queue-aware enqueue.
+  - Files:
+    - `include/task.h`
+    - `kernel/task.c`
+
+- Signal delivery and interrupted syscall behavior:
+  - Delivery now dequeues ordered pending unblocked signals first, then falls back to bitscan for overflow/fallback cases.
+  - `SA_RESTART` policy now depends on wait class:
+    - restart allowed for child wait / pipe read / pipe write waits,
+    - interruption (`-EINTR` style) forced for sleep-style waits (`sleep`/`poll` paths).
+  - Preserves prior behavior where non-restart handlers convert internal blocked return (`-2`) to interrupt return (`-4`).
+  - Files:
+    - `kernel/task.c`
+
+- POSIX-like fork/exec signal-state semantics:
+  - `fork` now inherits parent dispositions/masks (`signal_handler/restorer/flags/action_mask`, mask) and clears child pending/active state.
+  - `exec` now resets caught handlers to `SIG_DFL`, preserves `SIG_IGN`, clears pending/active frame state, and keeps mask (except non-blockable bits).
+  - Files:
+    - `kernel/task.c`
+
+- Test-suite stability:
+  - Attempted adding a shell-generated EL0 signal runtime program in `test.sh`, but removed it after confirming FuriOS shell parser edge-cases make this generated source path flaky.
+  - Restored deterministic full-suite behavior.
+  - File:
+    - `test.sh`
+
+### Validation
+- `make -j4` PASS.
+- `./test.sh` PASS.
+
+### External references used for this pass
+- Linux `signal(7)` default actions, pending/coalescing model, and `SA_RESTART` notes:
+  - https://man7.org/linux/man-pages/man7/signal.7.html
+- Linux `sigaction(2)` semantics:
+  - https://man7.org/linux/man-pages/man2/sigaction.2.html
+- Linux `sigprocmask(2)` semantics:
+  - https://man7.org/linux/man-pages/man2/sigprocmask.2.html
+- `LOOPS=8 QEMU_TIMEOUT=45 STEP=0.015 ./stress_ahci.sh` PASS.
+- `PHASE1_TIMEOUT=12 PHASE2_TIMEOUT=16 STEP=0.02 ./stress_nvme.sh` PASS.
+
+### External references used for this hardening pass
+- JBD2/ext4 journal block layout + replay/commit/revoke semantics:
+  - https://www.kernel.org/doc/html/latest/filesystems/ext4/journal.html
+- Linux `msync(2)` semantics and flag constraints:
+  - https://man7.org/linux/man-pages/man2/msync.2.html
+- Linux `fsync(2)` semantics:
+  - https://www.man7.org/linux/man-pages/man2/fsync.2.html
+- Virtio block status/operation requirements:
+  - https://docs.oasis-open.org/virtio/virtio/v1.2/csd01/virtio-v1.2-csd01.html
+
+## Step 39 (Loader/VM/JBD2/Signal/Storage reliability hardening)
+
+### What I changed
+
+- Dynamic loader compatibility pass (`/lib/ld-furios.so`):
+  - Added `DT_RPATH` + `DT_RUNPATH` parsing and per-object dependency search behavior.
+  - Added `$ORIGIN` expansion support in RPATH/RUNPATH path components.
+  - Search precedence now distinguishes legacy/new tags:
+    - `DT_RPATH` (only when no `DT_RUNPATH`) -> `LD_LIBRARY_PATH` -> `DT_RUNPATH` -> `/lib` -> `/usr/lib`.
+  - Added `DT_REL`/`DT_RELSZ`/`DT_RELENT` parsing and REL relocation application path.
+  - Added PLT relocation handling for both `DT_RELA` and `DT_REL` encodings.
+  - Files:
+    - `user/ld-furios.c`
+    - `include/elf.h`
+
+- Process/signal/waitpid ABI correctness:
+  - Switched wait status encoding to Unix-compatible layout:
+    - normal exit => `(code << 8)`
+    - signal exit => low 7 bits hold signal
+    - stop/continue retained as stop `0x7f` and continue `0xffff` forms.
+  - Added SDK wait macros for `WIFSIGNALED`/`WTERMSIG` and corrected `WIFEXITED`/`WEXITSTATUS`.
+  - `waitpid(..., WUNTRACED, ...)` now reports the task’s real recorded stop signal.
+  - `kill` now returns specific negative errno-style values for invalid signal/no target paths.
+  - Files:
+    - `kernel/task.c`
+    - `include/task.h`
+    - `kernel/fs.c` (SDK header generation)
+
+- Unified page-cache invalidate semantics hardening:
+  - `pagecache_invalidate_inode_range()` now returns status.
+  - `msync(MS_INVALIDATE)` now fails if overlapping cache pages are still pinned/busy,
+    instead of silently skipping and returning success.
+  - Files:
+    - `include/pagecache.h`
+    - `kernel/pagecache.c`
+    - `kernel/task.c`
+
+- ext4/JBD2 journal lifecycle hardening:
+  - Added explicit journal-space (`ENOSPC`-class) tracking in JBD2 tx path.
+  - Added explicit ENOSPC diagnostics on reserve pressure/failure.
+  - Added ext4-side last-error propagation hook so tx failures can be classified.
+  - Threaded tx error mapping into key fs ext4 mutators (`link/symlink/chmod/unlink/rmdir/rename/truncate`) so callers can receive specific negative errno values instead of generic `-1`.
+  - Files:
+    - `kernel/ext4.c`
+    - `include/ext4.h`
+    - `kernel/fs.c`
+
+- NVMe/AHCI interrupt-first completion tightening:
+  - Completion loops now enforce interrupt-first waiting with bounded fallback polling windows.
+  - Keeps IRQ-driven behavior as primary path while preserving forward progress on lost/late IRQ events.
+  - Files:
+    - `kernel/nvme.c`
+    - `kernel/ahci.c`
+
+### Validation
+- `make -j4` PASS.
+- `./test.sh` PASS.
+
+## Step 41 (Page-cache/JBD2 regression fix + signal runtime parity polish)
+
+### What I changed
+
+- True single-path page-cache fixups kept and validated:
+  - Retained prior block-device path unification (`fs_read`/`fs_write` -> page cache path for block dev inodes).
+  - Kept strict ordering in sync paths (`pagecache_flush_*` before ext4/journal sync and device cache flush).
+  - Removed stale direct block-device helpers in `kernel/fs.c` (`dev_block_read_inode` / `dev_block_write_inode`) to prevent dead-path drift.
+
+- JBD2 replay hardening corrected:
+  - Fixed regression introduced by over-strict descriptor/revoke validation:
+    - JBD2/ext4 metadata updates can legally target filesystem block `0` on 4KiB ext4 layouts.
+    - Removed invalid `fs_block == 0` rejection in:
+      - `ext4_jbd2_add_revoke`
+      - `ext4_jbd2_add_update`
+      - `ext4_jbd2_parse_descriptor_block`
+  - Kept upper-bound checks (`fs_block < blocks_count`) and journal-block ring bounds validation.
+
+- POSIX signal/runtime parity expanded:
+  - Added `SA_NOCLDWAIT` constant to kernel/user SDK headers.
+  - Added `SA_NOCLDWAIT` acceptance in `sigaction` flag mask.
+  - Implemented child auto-reap behavior when parent has:
+    - `SIGCHLD` disposition explicitly set to `SIG_IGN`, or
+    - `SA_NOCLDWAIT` set for `SIGCHLD`.
+  - Exit path now:
+    - performs normal SIGCHLD notify + waiter wake,
+    - then reaps child immediately for auto-reap cases (no zombie retention).
+
+- Test-suite hardening and stability:
+  - Fixed flaky `test.sh` signal-flag runtime source generation by splitting very long emitted shell lines into short deterministic lines (serial console input no longer truncates them).
+  - Extended signal runtime test (`/mnt/sigf.elf`) to validate:
+    - `SA_RESETHAND`,
+    - `SA_NODEFER`,
+    - `SA_NOCLDWAIT`,
+    - explicit `SIGCHLD=SIG_IGN` no-zombie behavior (`waitpid` negative path).
+
+### Validation
+
+- `make -j4` PASS.
+- `./test.sh` PASS.
+  - ext4 replay gate now passes again (`[ext4] jbd2 replay tx=2`).
+  - AHCI-only boot device enumeration gate still passes.
+
+### External references used for this pass
+
+- ext4 superblock `s_first_data_block` semantics (typically `0` for non-1KiB block sizes):
+  - https://www.kernel.org/doc/html/next/filesystems/ext4/super.html
+- Linux `sigaction(2)` semantics for `SA_NOCLDWAIT`, `SA_NODEFER`, `SA_RESETHAND`, and `SIGCHLD` handling:
+  - https://man7.org/linux/man-pages/man2/sigaction.2.html
+- Linux `waitpid(2)` behavior when `SIGCHLD` is `SIG_IGN` or `SA_NOCLDWAIT` is set (`ECHILD` semantics):
+  - https://man7.org/linux/man-pages/man2/waitpid.2.html
+
+## Step 42 (Output-noise reduction + JBD2 revoke strictness hardening)
+
+### What I changed
+
+- Reduced non-essential runtime noise:
+  - Shell no longer prints `[sh] terminated: ... code=...` for ordinary non-zero exit codes.
+  - It now only reports explicit stop/continue or real signal-termination cases.
+  - File:
+    - `user/sh.c`
+
+- Reduced boot-time debug chatter:
+  - Removed `[block-cache] selftest ok` informational print (selftest still runs; failure still reports/guards).
+  - Files:
+    - `kernel/block_cache.c`
+    - `test.sh` (removed now-obsolete grep gate)
+
+- JBD2 durability hardening (revoke path):
+  - Added strict overflow tracking for tx revoke records (`tx_revoke_overflow`).
+  - If revoke capacity is exceeded, commit now fails instead of silently dropping revoke coverage.
+  - This prevents hidden replay-safety degradation under metadata-heavy/free-heavy transactions.
+  - Removed block-0 special-case rejection in tx revoke note path (range check remains authoritative).
+  - Files:
+    - `kernel/ext4.c`
+
+- Additional log cleanup:
+  - Removed `[ext4] jbd2 replay tx=...` informational line; replay success/failure behavior unchanged.
+  - File:
+    - `kernel/ext4.c`
+
+### Validation
+
+- `make -j4` PASS.
+- `./test.sh` PASS.
+
+## Step 45 (JBD2 pressure/revoke correctness + safer cache invalidation)
+
+### What I changed
+
+- JBD2 revoke correctness fix on overwrite paths:
+  - Fixed a replay-safety bug where revoke entries were only removed on a subset of writes.
+  - Now any metadata write to a block within an active tx clears a prior revoke for that same block in that tx.
+  - This prevents stale revoke state from incorrectly suppressing valid journal updates after partial metadata writes.
+  - File:
+    - `kernel/ext4.c`
+
+- JBD2 tx-pressure behavior improved:
+  - Under pending-transaction pressure, checkpointing now runs in batched mode instead of one-by-one in tx start/commit reserve loops.
+  - This reduces ENOSPC thrash and advances tail faster under sustained metadata load.
+  - File:
+    - `kernel/ext4.c`
+
+- JBD2 ENOSPC/error classification tightening:
+  - Dirty-tx slot exhaustion (`EXT4_JBD2_TX_MAX_BLOCKS`) now marks tx as ENOSPC-class pressure (`tx_enospc`) rather than failing as generic error.
+  - File:
+    - `kernel/ext4.c`
+
+- Reduced non-essential debug spam while keeping important errors:
+  - Rate-limited `[ext4] jbd2 enospc ...` diagnostic emission (still visible, no longer flood-prone).
+  - Shell wait path no longer prints child-status noise (`continued/stopped/terminated`) for routine command flow.
+  - Files:
+    - `kernel/ext4.c`
+    - `user/sh.c`
+
+- Unified cache safety hardening for mmap/pinned pages:
+  - `pagecache_invalidate_inode()` now avoids dropping pages still referenced by active mappings/tasks (refcount > 1).
+  - Prevents invalidation from freeing live pages during truncate/unlink-heavy workloads with active mappings.
+  - For pages beyond current inode size, dirty is cleared so stale data is not written back.
+  - File:
+    - `kernel/pagecache.c`
+
+### Validation
+
+- `make -j4` PASS.
+- `./test.sh` PASS.
+- Full suite still passes ext4/JBD2 replay, mmap/msync paths, shell, and TCC/runtime coverage.

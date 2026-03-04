@@ -24,8 +24,182 @@ static uint32_t asid_epoch = 1;
 #define TASK_ASID_MIN 1U
 #define TASK_ASID_MAX 255U
 #define SIGBIT(sig) (1U << ((sig) & 31))
+#define WAIT_STATUS_EXIT(code) (((code) & 0xFF) << 8)
+#define WAIT_STATUS_SIG(sig) ((sig) & 0x7F)
+#define WAIT_STATUS_STOP(sig) ((((sig) & 0xFF) << 8) | 0x7F)
+#define WAIT_STATUS_CONT 0xFFFF
+#define KERR_ESRCH (-3)
+#define KERR_ECHILD (-10)
+#define KERR_EINVAL (-22)
 
 static void task_refresh_mem_accounting(task_t *t);
+static bool task_deliver_pending_signal(task_t *t);
+static bool task_signal_enqueue(task_t *t, int sig);
+static void task_signal_clear_pending(task_t *t, int sig);
+static void task_reset_signal_state_for_exec(task_t *t);
+static void task_inherit_signal_state_for_fork(task_t *child, const task_t *parent);
+static void task_debug_syms_clear(task_t *t);
+static void task_debug_syms_load(task_t *t, const uint8_t *elf, size_t elf_size,
+                                 const Elf64_Ehdr *eh);
+
+typedef enum {
+    TASK_CHLD_EXIT = 0,
+    TASK_CHLD_STOP,
+    TASK_CHLD_CONT,
+} task_child_event_t;
+
+static void task_set_comm_internal(task_t *task, const char *name) {
+    if (!task) {
+        return;
+    }
+    if (!name || name[0] == '\0') {
+        task->comm[0] = '\0';
+        return;
+    }
+    const char *base = name;
+    for (const char *p = name; *p; p++) {
+        if (*p == '/') {
+            base = p + 1;
+        }
+    }
+    if (base[0] == '\0') {
+        base = name;
+    }
+    strncpy(task->comm, base, sizeof(task->comm) - 1U);
+    task->comm[sizeof(task->comm) - 1U] = '\0';
+}
+
+static void task_debug_syms_clear(task_t *t) {
+    if (!t) {
+        return;
+    }
+    memset(t->debug_syms, 0, sizeof(t->debug_syms));
+    t->debug_sym_count = 0U;
+}
+
+static void task_debug_syms_add(task_t *t, uint64_t start, uint64_t end, const char *name) {
+    if (!t || !name || name[0] == '\0' || start < USER_VA_BASE || start >= USER_VA_LIMIT) {
+        return;
+    }
+    if (end <= start) {
+        end = start + 1U;
+    }
+    if (end > USER_VA_LIMIT) {
+        end = USER_VA_LIMIT;
+    }
+
+    for (uint16_t i = 0; i < t->debug_sym_count; i++) {
+        task_debug_sym_t *s = &t->debug_syms[i];
+        if (!s->used) {
+            continue;
+        }
+        if (s->start == start && strcmp(s->name, name) == 0) {
+            if (end > s->end) {
+                s->end = end;
+            }
+            return;
+        }
+    }
+
+    if (t->debug_sym_count >= TASK_DEBUG_SYMS_MAX) {
+        return;
+    }
+
+    task_debug_sym_t *slot = &t->debug_syms[t->debug_sym_count++];
+    memset(slot, 0, sizeof(*slot));
+    slot->start = start;
+    slot->end = end;
+    slot->used = true;
+    strncpy(slot->name, name, sizeof(slot->name) - 1U);
+    slot->name[sizeof(slot->name) - 1U] = '\0';
+}
+
+static void task_debug_syms_sort(task_t *t) {
+    if (!t || t->debug_sym_count < 2U) {
+        return;
+    }
+    for (uint16_t i = 1; i < t->debug_sym_count; i++) {
+        task_debug_sym_t key = t->debug_syms[i];
+        int j = (int)i - 1;
+        while (j >= 0 && t->debug_syms[j].start > key.start) {
+            t->debug_syms[j + 1] = t->debug_syms[j];
+            j--;
+        }
+        t->debug_syms[j + 1] = key;
+    }
+}
+
+static void task_debug_syms_load(task_t *t, const uint8_t *elf, size_t elf_size,
+                                 const Elf64_Ehdr *eh) {
+    if (!t || !elf || !eh) {
+        return;
+    }
+    task_debug_syms_clear(t);
+
+    if (eh->e_shoff == 0U || eh->e_shnum == 0U ||
+        eh->e_shentsize != sizeof(Elf64_Shdr)) {
+        return;
+    }
+    if (eh->e_shoff > elf_size ||
+        (uint64_t)eh->e_shnum * eh->e_shentsize > elf_size - eh->e_shoff) {
+        return;
+    }
+    if (eh->e_shnum > 1024U) {
+        return;
+    }
+
+    const Elf64_Shdr *sh = (const Elf64_Shdr *)(const void *)(elf + eh->e_shoff);
+    for (uint16_t i = 0; i < eh->e_shnum; i++) {
+        const Elf64_Shdr *symsh = &sh[i];
+        if (symsh->sh_type != SHT_SYMTAB && symsh->sh_type != SHT_DYNSYM) {
+            continue;
+        }
+        if (symsh->sh_link >= eh->e_shnum ||
+            symsh->sh_entsize < sizeof(Elf64_Sym) ||
+            symsh->sh_size < symsh->sh_entsize) {
+            continue;
+        }
+        if (symsh->sh_offset > elf_size ||
+            symsh->sh_size > elf_size - symsh->sh_offset) {
+            continue;
+        }
+
+        const Elf64_Shdr *strsh = &sh[symsh->sh_link];
+        if (strsh->sh_type != SHT_STRTAB ||
+            strsh->sh_offset > elf_size ||
+            strsh->sh_size > elf_size - strsh->sh_offset) {
+            continue;
+        }
+
+        const char *strtab = (const char *)(const void *)(elf + strsh->sh_offset);
+        const uint8_t *symbase = elf + symsh->sh_offset;
+        uint64_t nsyms = symsh->sh_size / symsh->sh_entsize;
+        for (uint64_t n = 0; n < nsyms; n++) {
+            const Elf64_Sym *sym =
+                (const Elf64_Sym *)(const void *)(symbase + n * symsh->sh_entsize);
+            if (ELF64_ST_TYPE(sym->st_info) != STT_FUNC ||
+                sym->st_shndx == SHN_UNDEF ||
+                sym->st_name >= strsh->sh_size) {
+                continue;
+            }
+            const char *name = strtab + sym->st_name;
+            if (!name[0]) {
+                continue;
+            }
+            uint64_t start = sym->st_value;
+            uint64_t end = start + sym->st_size;
+            task_debug_syms_add(t, start, end, name);
+            if (t->debug_sym_count >= TASK_DEBUG_SYMS_MAX) {
+                break;
+            }
+        }
+        if (t->debug_sym_count >= TASK_DEBUG_SYMS_MAX) {
+            break;
+        }
+    }
+
+    task_debug_syms_sort(t);
+}
 
 static uint32_t task_count_writable_intent_pages(const task_t *t) {
     uint32_t count = 0;
@@ -107,6 +281,19 @@ static inline uint64_t align_up(uint64_t x, uint64_t a) {
     return (x + a - 1UL) & ~(a - 1UL);
 }
 
+static void task_fill_aux_random(const task_t *t, uint8_t out[16]) {
+    if (!out) {
+        return;
+    }
+    uint64_t seed = timer_ticks() ^
+                    ((uint64_t)(t ? (uint32_t)t->pid : 0U) << 32) ^
+                    (uint64_t)(uintptr_t)t;
+    for (size_t i = 0; i < 16U; i++) {
+        seed = seed * 6364136223846793005ULL + 1ULL;
+        out[i] = (uint8_t)(seed >> 24);
+    }
+}
+
 static trapframe_t *task_kstack_tf(task_t *t) {
     return (trapframe_t *)(t->kstack_top - sizeof(trapframe_t));
 }
@@ -131,6 +318,17 @@ static void task_fd_drop(const fd_t *fd) {
     } else if (fd->kind == FD_PIPE_W) {
         pipe_close_write(fd->pipe);
     }
+}
+
+static bool task_fd_needs_writeback(const fd_t *fd) {
+    if (!fd || !fd->used || fd->kind != FD_INODE || !fd->inode) {
+        return false;
+    }
+    if (fd->inode->type != INODE_FILE && !fs_is_block_dev(fd->inode)) {
+        return false;
+    }
+    int mode = fd->flags & O_ACCMODE;
+    return mode == O_WRONLY || mode == O_RDWR;
 }
 
 static uint64_t task_stack_floor(const task_t *t) {
@@ -271,6 +469,7 @@ static task_t *task_alloc(void) {
             tasks[i].wait_kind = WAIT_NONE;
             tasks[i].wait_obj = 0;
             tasks[i].wake_tick = 0;
+            task_set_comm_internal(&tasks[i], "task");
             for (int fd = 0; fd < 3; fd++) {
                 tasks[i].fds[fd].used = true;
                 tasks[i].fds[fd].kind = FD_NONE;
@@ -621,7 +820,7 @@ static bool task_vma_writeback_page(const vm_area_t *v, const user_page_t *up) {
         return true;
     }
     inode_t *ino = v->inode;
-    if (ino->type != INODE_FILE || !ino->writable || !ino->data) {
+    if ((ino->type != INODE_FILE && !fs_is_block_dev(ino)) || !ino->writable) {
         return true;
     }
     if (up->va < v->start || up->va >= v->end) {
@@ -639,7 +838,7 @@ static bool task_vma_writeback_page(const vm_area_t *v, const user_page_t *up) {
 
 static bool task_map_user_file_fault_page(task_t *t, const vm_area_t *v, uint64_t va,
                                           bool writable, bool executable) {
-    if (!t || !v || !v->used || !v->inode || !v->inode->data) {
+    if (!t || !v || !v->used || !v->inode) {
         return false;
     }
     uint64_t map_off = va - v->start;
@@ -654,6 +853,9 @@ static bool task_map_user_file_fault_page(task_t *t, const vm_area_t *v, uint64_
             pmm_free_page((void *)pa);
             return false;
         }
+        if (writable) {
+            pagecache_mark_dirty(v->inode, file_off, PAGE_SIZE);
+        }
         mmu_tlb_flush_va(va, t->asid);
         return true;
     }
@@ -667,22 +869,13 @@ static bool task_map_user_file_fault_page(task_t *t, const vm_area_t *v, uint64_
         return false;
     }
 
-    size_t copy_len = 0;
-    if (file_off < v->inode->size) {
-        uint64_t file_rem = (uint64_t)v->inode->size - file_off;
-        uint64_t vma_rem = v->end - va;
-        uint64_t lim = PAGE_SIZE;
-        if (vma_rem < lim) {
-            lim = vma_rem;
-        }
-        if (file_rem < lim) {
-            lim = file_rem;
-        }
-        copy_len = (size_t)lim;
+    uint64_t cached_pa = 0;
+    if (!pagecache_get_or_create(v->inode, file_off, &cached_pa)) {
+        pmm_free_page(page);
+        return false;
     }
-    if (copy_len > 0) {
-        memcpy(page, v->inode->data + (size_t)file_off, copy_len);
-    }
+    memcpy(page, (const void *)(uintptr_t)cached_pa, PAGE_SIZE);
+    pmm_free_page((void *)(uintptr_t)cached_pa);
 
     if (!task_map_user_page(t, va, (uint64_t)page, writable, executable, false, writable)) {
         pmm_free_page(page);
@@ -830,12 +1023,68 @@ static task_t *task_parent_of(const task_t *child) {
     return task_by_pid(child->ppid);
 }
 
-static void task_notify_sigchld(const task_t *child) {
+static void task_signal_queue_remove_index(task_t *t, uint8_t idx) {
+    if (!t || idx >= t->signal_queue_count) {
+        return;
+    }
+    for (uint8_t i = (uint8_t)(idx + 1U); i < t->signal_queue_count; i++) {
+        t->signal_queue[i - 1U] = t->signal_queue[i];
+    }
+    t->signal_queue_count--;
+}
+
+static bool task_signal_enqueue(task_t *t, int sig) {
+    if (!t || sig <= 0 || sig >= 32) {
+        return false;
+    }
+
+    uint32_t bit = SIGBIT(sig);
+    if ((t->pending_signals & bit) != 0U) {
+        return true;
+    }
+
+    t->pending_signals |= bit;
+    if (t->signal_queue_count < TASK_SIGNAL_QUEUE_LEN) {
+        t->signal_queue[t->signal_queue_count++] = (uint8_t)sig;
+    }
+    return true;
+}
+
+static void task_signal_clear_pending(task_t *t, int sig) {
+    if (!t || sig <= 0 || sig >= 32) {
+        return;
+    }
+
+    t->pending_signals &= ~SIGBIT(sig);
+    for (uint8_t i = 0; i < t->signal_queue_count;) {
+        if (t->signal_queue[i] == (uint8_t)sig) {
+            task_signal_queue_remove_index(t, i);
+            continue;
+        }
+        i++;
+    }
+}
+
+static void task_notify_sigchld(const task_t *child, task_child_event_t ev) {
     task_t *parent = task_parent_of(child);
     if (!parent || parent->state == TASK_UNUSED || parent->state == TASK_ZOMBIE) {
         return;
     }
-    parent->pending_signals |= SIGBIT(SIGCHLD);
+    if ((ev == TASK_CHLD_STOP || ev == TASK_CHLD_CONT) &&
+        (parent->signal_flags[SIGCHLD] & SA_NOCLDSTOP) != 0U) {
+        return;
+    }
+    (void)task_signal_enqueue(parent, SIGCHLD);
+}
+
+static bool task_sigchld_auto_reap(const task_t *parent) {
+    if (!parent || parent->state == TASK_UNUSED || parent->state == TASK_ZOMBIE) {
+        return false;
+    }
+    if (parent->signal_handler[SIGCHLD] == SIG_IGN) {
+        return true;
+    }
+    return (parent->signal_flags[SIGCHLD] & SA_NOCLDWAIT) != 0U;
 }
 
 static void task_reparent_children(int old_ppid) {
@@ -860,6 +1109,8 @@ static void task_force_exit(task_t *victim, int code) {
     if (!victim || victim->state == TASK_UNUSED || victim->state == TASK_ZOMBIE) {
         return;
     }
+    task_t *parent = task_parent_of(victim);
+    bool auto_reap = task_sigchld_auto_reap(parent);
     for (int fd = 0; fd < MAX_FDS; fd++) {
         if (victim->fds[fd].used) {
             task_fd_close(victim, fd);
@@ -872,9 +1123,20 @@ static void task_force_exit(task_t *victim, int code) {
     victim->wait_obj = 0;
     victim->wake_tick = 0;
     victim->pending_signals = 0;
-    task_notify_sigchld(victim);
+    victim->signal_queue_count = 0U;
+    victim->signal_mask = 0;
+    victim->signal_active = false;
+    victim->signal_active_num = 0;
+    victim->signal_saved_mask = 0;
+    victim->stop_report_pending = false;
+    victim->cont_report_pending = false;
+    victim->stop_signal = 0U;
+    task_notify_sigchld(victim, TASK_CHLD_EXIT);
     task_reparent_children(victim->pid);
     task_wake_waiters(victim->pid);
+    if (auto_reap) {
+        task_reap_slot(victim);
+    }
 }
 
 static bool task_parent_alive(const task_t *t) {
@@ -906,6 +1168,74 @@ static void task_reap_orphan_zombies(const task_t *exclude) {
     }
 }
 
+static bool task_parent_has_child_sigchld_event(const task_t *parent) {
+    if (!parent) {
+        return false;
+    }
+    bool nocldstop = (parent->signal_flags[SIGCHLD] & SA_NOCLDSTOP) != 0U;
+    for (int i = 0; i < MAX_TASKS; i++) {
+        const task_t *child = &tasks[i];
+        if (child->state == TASK_UNUSED || child->ppid != parent->pid) {
+            continue;
+        }
+        if (child->state == TASK_ZOMBIE ||
+            (!nocldstop && child->state == TASK_STOPPED && child->stop_report_pending) ||
+            (!nocldstop && child->cont_report_pending)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void task_reset_signal_state_for_exec(task_t *t) {
+    if (!t) {
+        return;
+    }
+
+    t->pending_signals = 0U;
+    t->signal_queue_count = 0U;
+    memset(t->signal_queue, 0, sizeof(t->signal_queue));
+    t->signal_active = false;
+    t->signal_active_num = 0U;
+    t->signal_saved_mask = 0U;
+    memset(&t->signal_saved_tf, 0, sizeof(t->signal_saved_tf));
+
+    for (int sig = 1; sig < 32; sig++) {
+        if (t->signal_handler[sig] == SIG_IGN) {
+            t->signal_flags[sig] = 0U;
+            t->signal_restorer[sig] = 0U;
+            t->signal_action_mask[sig] = 0U;
+            continue;
+        }
+        t->signal_handler[sig] = SIG_DFL;
+        t->signal_flags[sig] = 0U;
+        t->signal_restorer[sig] = 0U;
+        t->signal_action_mask[sig] = 0U;
+    }
+
+    t->signal_mask &= ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
+}
+
+static void task_inherit_signal_state_for_fork(task_t *child, const task_t *parent) {
+    if (!child || !parent) {
+        return;
+    }
+
+    child->signal_mask = parent->signal_mask & ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
+    memcpy(child->signal_handler, parent->signal_handler, sizeof(child->signal_handler));
+    memcpy(child->signal_restorer, parent->signal_restorer, sizeof(child->signal_restorer));
+    memcpy(child->signal_flags, parent->signal_flags, sizeof(child->signal_flags));
+    memcpy(child->signal_action_mask, parent->signal_action_mask, sizeof(child->signal_action_mask));
+
+    child->pending_signals = 0U;
+    child->signal_queue_count = 0U;
+    memset(child->signal_queue, 0, sizeof(child->signal_queue));
+    child->signal_active = false;
+    child->signal_active_num = 0U;
+    child->signal_saved_mask = 0U;
+    memset(&child->signal_saved_tf, 0, sizeof(child->signal_saved_tf));
+}
+
 static bool task_translate(task_t *t, uint64_t va, uint64_t *pa_out) {
     uint64_t va_page = align_down(va, PAGE_SIZE);
     user_page_t *up = task_find_page(t, va_page);
@@ -928,6 +1258,99 @@ static bool task_copy_to_user_va(task_t *t, uint64_t dst_va, const void *src, si
     return true;
 }
 
+static bool task_validate_elf_loads(const Elf64_Phdr *ph, uint16_t phnum, uint16_t phentsize,
+                                    size_t elf_size, uint64_t *max_load_end_out,
+                                    size_t *mapped_pages_out) {
+    if (!ph || phentsize != sizeof(Elf64_Phdr) || !max_load_end_out || !mapped_pages_out) {
+        return false;
+    }
+
+    enum {
+        USER_EXEC_PAGE_SLOTS = (USER_VA_LIMIT - USER_VA_BASE) / PAGE_SIZE
+    };
+    bool seen[USER_EXEC_PAGE_SLOTS];
+    memset(seen, 0, sizeof(seen));
+
+    uint64_t max_load_end = USER_VA_BASE;
+    size_t mapped_pages = 0;
+
+    for (uint16_t i = 0; i < phnum; i++) {
+        if (ph[i].p_type != PT_LOAD || ph[i].p_memsz == 0U) {
+            continue;
+        }
+        if (ph[i].p_filesz > ph[i].p_memsz) {
+            return false;
+        }
+        if (ph[i].p_vaddr < USER_VA_BASE) {
+            return false;
+        }
+        if (ph[i].p_vaddr > USER_VA_LIMIT - ph[i].p_memsz) {
+            return false;
+        }
+        if (ph[i].p_offset > (uint64_t)elf_size) {
+            return false;
+        }
+        if (ph[i].p_filesz > (uint64_t)elf_size - ph[i].p_offset) {
+            return false;
+        }
+
+        uint64_t start = align_down(ph[i].p_vaddr, PAGE_SIZE);
+        uint64_t end = align_up(ph[i].p_vaddr + ph[i].p_memsz, PAGE_SIZE);
+        if (end > USER_VA_LIMIT || end < start) {
+            return false;
+        }
+        if (end > max_load_end) {
+            max_load_end = end;
+        }
+
+        for (uint64_t va = start; va < end; va += PAGE_SIZE) {
+            size_t idx = (size_t)((va - USER_VA_BASE) / PAGE_SIZE);
+            if (idx >= USER_EXEC_PAGE_SLOTS) {
+                return false;
+            }
+            if (!seen[idx]) {
+                seen[idx] = true;
+                mapped_pages++;
+            }
+        }
+    }
+
+    if (mapped_pages == 0U) {
+        return false;
+    }
+    *max_load_end_out = max_load_end;
+    *mapped_pages_out = mapped_pages;
+    return true;
+}
+
+static uint64_t task_elf_phdr_user_addr(const Elf64_Ehdr *eh, const Elf64_Phdr *ph, size_t elf_size) {
+    if (!eh || !ph || eh->e_phoff >= elf_size) {
+        return 0;
+    }
+
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type == 6U) { /* PT_PHDR */
+            return ph[i].p_vaddr;
+        }
+    }
+
+    uint64_t phoff = eh->e_phoff;
+    uint64_t phsize = (uint64_t)eh->e_phnum * eh->e_phentsize;
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type != PT_LOAD || ph[i].p_filesz == 0U) {
+            continue;
+        }
+        if (ph[i].p_offset > phoff) {
+            continue;
+        }
+        if (phoff + phsize > ph[i].p_offset + ph[i].p_filesz) {
+            continue;
+        }
+        return ph[i].p_vaddr + (phoff - ph[i].p_offset);
+    }
+    return 0;
+}
+
 static bool task_load_elf(task_t *t, const uint8_t *elf, size_t elf_size,
                           const char *const argv[]) {
     if (elf_size < sizeof(Elf64_Ehdr)) {
@@ -945,14 +1368,27 @@ static bool task_load_elf(task_t *t, const uint8_t *elf, size_t elf_size,
         return false;
     }
 
-    if (eh->e_phoff + (uint64_t)eh->e_phnum * eh->e_phentsize > elf_size) {
+    if (eh->e_phoff > elf_size ||
+        (uint64_t)eh->e_phnum * eh->e_phentsize > elf_size - eh->e_phoff) {
+        return false;
+    }
+    const Elf64_Phdr *ph = (const Elf64_Phdr *)(elf + eh->e_phoff);
+    uint64_t max_load_end = USER_VA_BASE;
+    size_t mapped_pages = 0;
+    if (!task_validate_elf_loads(ph, eh->e_phnum, eh->e_phentsize, elf_size,
+                                 &max_load_end, &mapped_pages)) {
         return false;
     }
 
+    size_t needed_pages = mapped_pages + 1U;
+    if (needed_pages > MAX_USER_PAGES ||
+        pmm_available_pages() <= PMM_OOM_RESERVE_PAGES + needed_pages) {
+        return false;
+    }
+    task_load_debug_symbols(t, elf, elf_size);
+
     task_unmap_user(t);
 
-    uint64_t max_load_end = USER_VA_BASE;
-    const Elf64_Phdr *ph = (const Elf64_Phdr *)(elf + eh->e_phoff);
     for (uint16_t i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type != PT_LOAD) {
             continue;
@@ -960,22 +1396,32 @@ static bool task_load_elf(task_t *t, const uint8_t *elf, size_t elf_size,
         if (ph[i].p_memsz == 0) {
             continue;
         }
-        if (ph[i].p_vaddr < USER_VA_BASE || ph[i].p_vaddr + ph[i].p_memsz > USER_VA_LIMIT) {
-            return false;
-        }
-        if (ph[i].p_offset + ph[i].p_filesz > elf_size) {
-            return false;
-        }
 
         uint64_t start = align_down(ph[i].p_vaddr, PAGE_SIZE);
         uint64_t end = align_up(ph[i].p_vaddr + ph[i].p_memsz, PAGE_SIZE);
-        if (end > max_load_end) {
-            max_load_end = end;
-        }
         bool writable = (ph[i].p_flags & PF_W) != 0;
         bool executable = (ph[i].p_flags & PF_X) != 0;
 
         for (uint64_t va = start; va < end; va += PAGE_SIZE) {
+            user_page_t *existing = task_find_page(t, va);
+            if (existing) {
+                bool cur_w = false;
+                bool cur_x = false;
+                bool cur_cow = false;
+                if (!task_page_validate_hw(t, existing, 0, &cur_w, &cur_x, &cur_cow)) {
+                    return false;
+                }
+                bool merged_w = cur_w || writable;
+                bool merged_x = cur_x || executable;
+                bool merged_cow = cur_cow && !merged_w;
+                if (!task_set_user_pte(t, va, existing->pa,
+                                       task_user_attrs(merged_w, merged_x, merged_cow))) {
+                    return false;
+                }
+                existing->writable_intent = existing->writable_intent || writable;
+                mmu_tlb_flush_va(va, t->asid);
+                continue;
+            }
             if (pmm_available_pages() <= PMM_OOM_RESERVE_PAGES) {
                 return false;
             }
@@ -1002,6 +1448,28 @@ static bool task_load_elf(task_t *t, const uint8_t *elf, size_t elf_size,
                 return false;
             }
         }
+    }
+
+    /* Some static linkers emit overlapping PT_LOAD segments where entry lands
+       in a page also covered by a non-exec segment. Ensure entry page remains
+       executable if it is mapped at all. */
+    uint64_t entry_page = align_down(eh->e_entry, PAGE_SIZE);
+    user_page_t *entry_up = task_find_page(t, entry_page);
+    if (!entry_up) {
+        return false;
+    }
+    bool entry_w = false;
+    bool entry_x = false;
+    bool entry_cow = false;
+    if (!task_page_validate_hw(t, entry_up, 0, &entry_w, &entry_x, &entry_cow)) {
+        return false;
+    }
+    if (!entry_x) {
+        if (!task_set_user_pte(t, entry_page, entry_up->pa,
+                               task_user_attrs(entry_w, true, entry_cow))) {
+            return false;
+        }
+        mmu_tlb_flush_va(entry_page, t->asid);
     }
 
     uint64_t stack_base = USER_STACK_TOP - (USER_STACK_PAGES * PAGE_SIZE);
@@ -1041,6 +1509,9 @@ static bool task_load_elf(task_t *t, const uint8_t *elf, size_t elf_size,
 
     uint64_t sp = USER_STACK_TOP;
     uint64_t arg_ptrs[MAX_ARGV + 1];
+    enum { TASK_AUXV_CAP = 24 };
+    Elf64_auxv_t auxv[TASK_AUXV_CAP];
+    size_t auxc = 0U;
 
     for (int i = argc - 1; i >= 0; i--) {
         size_t n = strlen(kargv[i]) + 1;
@@ -1052,9 +1523,56 @@ static bool task_load_elf(task_t *t, const uint8_t *elf, size_t elf_size,
     }
     arg_ptrs[argc] = 0;
 
+    uint8_t aux_random[16];
+    task_fill_aux_random(t, aux_random);
+    sp -= sizeof(aux_random);
+    if (!task_copy_to_user_va(t, sp, aux_random, sizeof(aux_random))) {
+        return false;
+    }
+    uint64_t aux_random_user = sp;
+
+    uint64_t phdr_addr = task_elf_phdr_user_addr(eh, ph, elf_size);
+
+    auxv[auxc++] = (Elf64_auxv_t){AT_PHDR, phdr_addr};
+    auxv[auxc++] = (Elf64_auxv_t){AT_PHENT, eh->e_phentsize};
+    auxv[auxc++] = (Elf64_auxv_t){AT_PHNUM, eh->e_phnum};
+    auxv[auxc++] = (Elf64_auxv_t){AT_PAGESZ, PAGE_SIZE};
+    auxv[auxc++] = (Elf64_auxv_t){AT_BASE, 0U};
+    auxv[auxc++] = (Elf64_auxv_t){AT_ENTRY, eh->e_entry};
+    auxv[auxc++] = (Elf64_auxv_t){AT_UID, 0U};
+    auxv[auxc++] = (Elf64_auxv_t){AT_EUID, 0U};
+    auxv[auxc++] = (Elf64_auxv_t){AT_GID, 0U};
+    auxv[auxc++] = (Elf64_auxv_t){AT_EGID, 0U};
+    auxv[auxc++] = (Elf64_auxv_t){AT_HWCAP, 0U};
+    auxv[auxc++] = (Elf64_auxv_t){AT_HWCAP2, 0U};
+    auxv[auxc++] = (Elf64_auxv_t){AT_CLKTCK, TIMER_HZ};
+    auxv[auxc++] = (Elf64_auxv_t){AT_SECURE, 0U};
+    auxv[auxc++] = (Elf64_auxv_t){AT_RANDOM, aux_random_user};
+    auxv[auxc++] = (Elf64_auxv_t){AT_EXECFN, (argc > 0) ? arg_ptrs[0] : 0U};
+    auxv[auxc++] = (Elf64_auxv_t){AT_NULL, 0U};
+
     sp &= ~0xFUL;
-    sp -= (uint64_t)((argc + 1) * sizeof(uint64_t));
-    if (!task_copy_to_user_va(t, sp, arg_ptrs, (size_t)(argc + 1) * sizeof(uint64_t))) {
+    size_t stack_words = 1U + (size_t)argc + 1U + 1U + (auxc * 2U);
+    size_t stack_bytes = stack_words * sizeof(uint64_t);
+    sp -= (uint64_t)stack_bytes;
+
+    uint64_t frame[1 + MAX_ARGV + 1 + 1 + (TASK_AUXV_CAP * 2)];
+    size_t wi = 0U;
+    frame[wi++] = (uint64_t)argc;
+    for (int i = 0; i < argc; i++) {
+        frame[wi++] = arg_ptrs[i];
+    }
+    frame[wi++] = 0U; /* argv terminator */
+    frame[wi++] = 0U; /* envp terminator (no env yet) */
+    for (size_t i = 0; i < auxc; i++) {
+        frame[wi++] = auxv[i].a_type;
+        frame[wi++] = auxv[i].a_val;
+    }
+    if (wi != stack_words) {
+        return false;
+    }
+
+    if (!task_copy_to_user_va(t, sp, frame, stack_bytes)) {
         return false;
     }
 
@@ -1067,7 +1585,9 @@ static bool task_load_elf(task_t *t, const uint8_t *elf, size_t elf_size,
     t->tf->sp_el0 = sp;
     t->tf->spsr_el1 = 0;
     t->tf->x[0] = (uint64_t)argc;
-    t->tf->x[1] = sp;
+    t->tf->x[1] = sp + sizeof(uint64_t);
+    t->tf->x[2] = sp + sizeof(uint64_t) * (2U + (uint64_t)argc);
+    t->tf->x[3] = sp + sizeof(uint64_t) * (3U + (uint64_t)argc);
 
     task_refresh_mem_accounting(t);
     return true;
@@ -1102,6 +1622,10 @@ int task_exec(task_t *task, const uint8_t *elf, size_t elf_size, const char *con
     if (!task_load_elf(task, elf, elf_size, argv)) {
         return -1;
     }
+    task_reset_signal_state_for_exec(task);
+    if (argv && argv[0]) {
+        task_set_comm_internal(task, argv[0]);
+    }
     return 0;
 }
 
@@ -1127,6 +1651,9 @@ task_t *task_create_user(const uint8_t *elf, size_t elf_size, int ppid) {
     if (task_exec(t, elf, elf_size, 0) != 0) {
         task_reap_slot(t);
         return 0;
+    }
+    if (ppid <= 0 && init_pid == t->pid) {
+        task_set_comm_internal(t, "init");
     }
     return t;
 }
@@ -1168,6 +1695,33 @@ trapframe_t *task_schedule_from_trap(trapframe_t *current_tf, bool force_resched
     if (!next && current_task_ptr && current_task_ptr->state == TASK_RUNNABLE) {
         next = current_task_ptr;
     }
+    while (!next) {
+        if (task_wake_sleepers(timer_ticks())) {
+            next = task_next_runnable(current_task_ptr);
+            if (!next && current_task_ptr && current_task_ptr->state == TASK_RUNNABLE) {
+                next = current_task_ptr;
+            }
+        }
+        if (!next) {
+            __asm__ volatile("yield");
+        }
+    }
+
+    while (next) {
+        if (!task_deliver_pending_signal(next) ||
+            next->state == TASK_ZOMBIE ||
+            next->state == TASK_STOPPED ||
+            next->state == TASK_WAITING) {
+            task_t *from = next;
+            next = task_next_runnable(from);
+            if (!next && current_task_ptr && current_task_ptr->state == TASK_RUNNABLE) {
+                next = current_task_ptr;
+            }
+            continue;
+        }
+        break;
+    }
+
     while (!next) {
         if (task_wake_sleepers(timer_ticks())) {
             next = task_next_runnable(current_task_ptr);
@@ -1308,6 +1862,9 @@ int task_fork(const trapframe_t *parent_tf) {
         }
     }
     strcpy(child->cwd, parent->cwd);
+    strncpy(child->comm, parent->comm, sizeof(child->comm) - 1U);
+    child->comm[sizeof(child->comm) - 1U] = '\0';
+    task_inherit_signal_state_for_fork(child, parent);
 
     child->state = TASK_RUNNABLE;
     task_refresh_mem_accounting(parent);
@@ -1320,7 +1877,7 @@ void task_mark_exit(int code) {
     if (!self) {
         return;
     }
-    task_force_exit(self, code);
+    task_force_exit(self, WAIT_STATUS_EXIT(code));
 }
 
 void task_wake_waiters(int child_pid) {
@@ -1349,8 +1906,8 @@ int task_wait(int pid, int options, int *status_out) {
     if (!self) {
         return -1;
     }
-    if ((options & ~WNOHANG) != 0) {
-        return -1;
+    if ((options & ~(WNOHANG | WUNTRACED | WCONTINUED)) != 0) {
+        return KERR_EINVAL;
     }
 
     bool has_child = false;
@@ -1369,14 +1926,39 @@ int task_wait(int pid, int options, int *status_out) {
                 *status_out = t->exit_code;
             }
             task_reap_slot(t);
-            self->pending_signals &= ~SIGBIT(SIGCHLD);
+            if (!task_parent_has_child_sigchld_event(self)) {
+                task_signal_clear_pending(self, SIGCHLD);
+            }
             return ret_pid;
+        }
+        if ((options & WUNTRACED) &&
+            t->state == TASK_STOPPED &&
+            t->stop_report_pending) {
+            int stop_sig = t->stop_signal ? (int)t->stop_signal : SIGSTOP;
+            t->stop_report_pending = false;
+            if (status_out) {
+                *status_out = WAIT_STATUS_STOP(stop_sig);
+            }
+            if (!task_parent_has_child_sigchld_event(self)) {
+                task_signal_clear_pending(self, SIGCHLD);
+            }
+            return t->pid;
+        }
+        if ((options & WCONTINUED) && t->cont_report_pending) {
+            t->cont_report_pending = false;
+            if (status_out) {
+                *status_out = WAIT_STATUS_CONT;
+            }
+            if (!task_parent_has_child_sigchld_event(self)) {
+                task_signal_clear_pending(self, SIGCHLD);
+            }
+            return t->pid;
         }
     }
 
     if (!has_child) {
-        self->pending_signals &= ~SIGBIT(SIGCHLD);
-        return -1;
+        task_signal_clear_pending(self, SIGCHLD);
+        return KERR_ECHILD;
     }
     if (options & WNOHANG) {
         return 0;
@@ -1446,10 +2028,70 @@ int task_getpgid(int pid) {
 }
 
 static bool task_signal_supported(int sig) {
-    return sig == 0 || sig == SIGTERM || sig == SIGKILL;
+    return sig == 0 || sig == SIGHUP || sig == SIGINT || sig == SIGQUIT ||
+           sig == SIGTERM || sig == SIGKILL || sig == SIGSTOP ||
+           sig == SIGCONT || sig == SIGCHLD;
+}
+
+typedef enum {
+    TASK_SIG_DFL_TERM = 0,
+    TASK_SIG_DFL_IGNORE,
+    TASK_SIG_DFL_STOP,
+    TASK_SIG_DFL_CONT,
+} task_sig_default_action_t;
+
+static task_sig_default_action_t task_signal_default_action(int sig) {
+    switch (sig) {
+        case SIGCHLD:
+            return TASK_SIG_DFL_IGNORE;
+        case SIGSTOP:
+            return TASK_SIG_DFL_STOP;
+        case SIGCONT:
+            return TASK_SIG_DFL_CONT;
+        case SIGHUP:
+        case SIGINT:
+        case SIGQUIT:
+        case SIGTERM:
+        case SIGKILL:
+        default:
+            return TASK_SIG_DFL_TERM;
+    }
+}
+
+static bool task_signal_blocked(const task_t *t, int sig) {
+    if (!t || sig <= 0 || sig >= 32) {
+        return false;
+    }
+    if (sig == SIGKILL || sig == SIGSTOP) {
+        return false;
+    }
+    return (t->signal_mask & SIGBIT(sig)) != 0U;
+}
+
+static bool task_signal_may_restart_wait(wait_kind_t kind) {
+    return kind == WAIT_PIPE_READ || kind == WAIT_PIPE_WRITE || kind == WAIT_CHILD;
+}
+
+static void task_signal_wake_waiter(task_t *victim, bool handler_restart) {
+    if (!victim || victim->state != TASK_WAITING) {
+        return;
+    }
+    wait_kind_t wait_kind = victim->wait_kind;
+    victim->state = TASK_RUNNABLE;
+    victim->wait_pid = -1;
+    victim->wait_kind = WAIT_NONE;
+    victim->wait_obj = 0;
+    victim->wake_tick = 0;
+    bool restart_ok = handler_restart && task_signal_may_restart_wait(wait_kind);
+    if (victim->tf && (int64_t)victim->tf->x[0] == -2 && !restart_ok) {
+        victim->tf->x[0] = (uint64_t)-4;
+    }
 }
 
 static int task_signal_one(task_t *self, task_t *victim, int sig) {
+    uint64_t handler = SIG_DFL;
+    uint32_t flags = 0U;
+
     if (!victim || victim->state == TASK_UNUSED) {
         return 0;
     }
@@ -1459,20 +2101,193 @@ static int task_signal_one(task_t *self, task_t *victim, int sig) {
     if (sig == 0 || victim->state == TASK_ZOMBIE) {
         return 1;
     }
-    task_force_exit(victim, 128 + sig);
+    if (sig > 0 && sig < 32) {
+        handler = victim->signal_handler[sig];
+        flags = victim->signal_flags[sig];
+    }
+
+    if (sig == SIGKILL) {
+        task_force_exit(victim, WAIT_STATUS_SIG(sig));
+        return 1;
+    }
+
+    if (handler == SIG_IGN && sig != SIGSTOP && sig != SIGKILL) {
+        return 1;
+    }
+
+    (void)task_signal_enqueue(victim, sig);
+
+    if (task_signal_blocked(victim, sig)) {
+        return 1;
+    }
+
+    if (sig == SIGCONT) {
+        if (victim->state == TASK_STOPPED) {
+            victim->state = TASK_RUNNABLE;
+            victim->cont_report_pending = true;
+            victim->stop_report_pending = false;
+            victim->stop_signal = 0U;
+            task_notify_sigchld(victim, TASK_CHLD_CONT);
+            task_wake_waiters(victim->pid);
+        }
+        task_signal_wake_waiter(victim, true);
+        return 1;
+    }
+
+    if (sig == SIGSTOP) {
+        if (victim->state != TASK_STOPPED) {
+            victim->state = TASK_STOPPED;
+            victim->wait_pid = -1;
+            victim->wait_kind = WAIT_NONE;
+            victim->wait_obj = 0;
+            victim->wake_tick = 0;
+            victim->cont_report_pending = false;
+            victim->stop_report_pending = true;
+            victim->stop_signal = (uint8_t)sig;
+            task_notify_sigchld(victim, TASK_CHLD_STOP);
+            task_wake_waiters(victim->pid);
+        }
+        return 1;
+    }
+
+    bool restart_ok = (handler != SIG_DFL && (flags & SA_RESTART) != 0U);
+    task_signal_wake_waiter(victim, restart_ok);
     return 1;
+}
+
+static int task_pick_pending_unblocked(task_t *t) {
+    if (!t) {
+        return 0;
+    }
+
+    for (uint8_t i = 0U; i < t->signal_queue_count;) {
+        int sig = (int)t->signal_queue[i];
+        if (sig <= 0 || sig >= 32 || (t->pending_signals & SIGBIT(sig)) == 0U) {
+            task_signal_queue_remove_index(t, i);
+            continue;
+        }
+        if (task_signal_blocked(t, sig)) {
+            i++;
+            continue;
+        }
+        task_signal_queue_remove_index(t, i);
+        t->pending_signals &= ~SIGBIT(sig);
+        return sig;
+    }
+
+    for (int sig = 1; sig < 32; sig++) {
+        if ((t->pending_signals & SIGBIT(sig)) == 0U) {
+            continue;
+        }
+        if (task_signal_blocked(t, sig)) {
+            continue;
+        }
+        t->pending_signals &= ~SIGBIT(sig);
+        return sig;
+    }
+    return 0;
+}
+
+static bool task_deliver_pending_signal(task_t *t) {
+    if (!t || !t->tf || t->state == TASK_UNUSED || t->state == TASK_ZOMBIE) {
+        return true;
+    }
+
+    while (true) {
+        int sig = task_pick_pending_unblocked(t);
+        if (sig <= 0) {
+            return true;
+        }
+
+        uint64_t handler = t->signal_handler[sig];
+        uint64_t restorer = t->signal_restorer[sig];
+        uint32_t flags = t->signal_flags[sig];
+        uint32_t action_mask = t->signal_action_mask[sig];
+        task_sig_default_action_t dfl = task_signal_default_action(sig);
+
+        if (handler == SIG_IGN || (handler == SIG_DFL && dfl == TASK_SIG_DFL_IGNORE)) {
+            continue;
+        }
+
+        if (handler == SIG_DFL) {
+            if (dfl == TASK_SIG_DFL_CONT) {
+                if (t->state == TASK_STOPPED) {
+                    t->state = TASK_RUNNABLE;
+                    t->cont_report_pending = true;
+                    t->stop_report_pending = false;
+                    t->stop_signal = 0U;
+                    task_notify_sigchld(t, TASK_CHLD_CONT);
+                    task_wake_waiters(t->pid);
+                }
+                continue;
+            }
+            if (dfl == TASK_SIG_DFL_STOP) {
+                if (t->state != TASK_STOPPED) {
+                    t->state = TASK_STOPPED;
+                    t->wait_pid = -1;
+                    t->wait_kind = WAIT_NONE;
+                    t->wait_obj = 0;
+                    t->wake_tick = 0;
+                    t->cont_report_pending = false;
+                    t->stop_report_pending = true;
+                    t->stop_signal = (uint8_t)sig;
+                    task_notify_sigchld(t, TASK_CHLD_STOP);
+                    task_wake_waiters(t->pid);
+                }
+                return false;
+            }
+            task_force_exit(t, WAIT_STATUS_SIG(sig));
+            return false;
+        }
+
+        if (t->signal_active) {
+            (void)task_signal_enqueue(t, sig);
+            return true;
+        }
+        if ((flags & SA_RESTORER) == 0U || restorer < USER_VA_BASE || restorer >= USER_VA_LIMIT ||
+            handler < USER_VA_BASE || handler >= USER_VA_LIMIT) {
+            task_force_exit(t, WAIT_STATUS_SIG(SIGTERM));
+            return false;
+        }
+
+        trapframe_t saved = *t->tf;
+        if ((int64_t)saved.x[0] == -2 && (flags & SA_RESTART) == 0U) {
+            saved.x[0] = (uint64_t)-4;
+        }
+        t->signal_saved_tf = saved;
+        t->signal_saved_mask = t->signal_mask;
+        t->signal_active = true;
+        t->signal_active_num = (uint8_t)sig;
+        if ((flags & SA_RESETHAND) != 0U) {
+            t->signal_handler[sig] = SIG_DFL;
+            t->signal_flags[sig] = 0U;
+            t->signal_restorer[sig] = 0U;
+            t->signal_action_mask[sig] = 0U;
+        }
+
+        t->signal_mask |= (uint32_t)(action_mask & 0x7FFFFFFFUL);
+        if ((flags & SA_NODEFER) == 0U) {
+            t->signal_mask |= SIGBIT(sig);
+        }
+        t->signal_mask &= ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
+
+        t->tf->elr_el1 = handler;
+        t->tf->x[0] = (uint64_t)sig;
+        t->tf->x[30] = restorer;
+        return true;
+    }
 }
 
 int task_kill(int pid, int sig) {
     task_t *self = current_task_ptr;
     if (!self || !task_signal_supported(sig)) {
-        return -1;
+        return KERR_EINVAL;
     }
 
     int matched = 0;
     if (pid > 0) {
         task_t *victim = task_by_pid(pid);
-        return task_signal_one(self, victim, sig) ? 0 : -1;
+        return task_signal_one(self, victim, sig) ? 0 : KERR_ESRCH;
     }
 
     for (int i = 0; i < MAX_TASKS; i++) {
@@ -1492,9 +2307,74 @@ int task_kill(int pid, int sig) {
         matched += task_signal_one(self, victim, sig);
     }
     if (matched == 0) {
-        return -1;
+        return KERR_ESRCH;
     }
     return 0;
+}
+
+int task_sigaction(int sig, const fu_sigaction_t *act, fu_sigaction_t *oldact) {
+    task_t *self = current_task_ptr;
+    if (!self || sig <= 0 || sig >= 32 || !task_signal_supported(sig)) {
+        return KERR_EINVAL;
+    }
+    if (oldact) {
+        oldact->sa_handler = self->signal_handler[sig];
+        oldact->sa_flags = self->signal_flags[sig];
+        oldact->sa_restorer = self->signal_restorer[sig];
+        oldact->sa_mask = self->signal_action_mask[sig];
+    }
+    if (!act) {
+        return 0;
+    }
+    if ((sig == SIGKILL || sig == SIGSTOP) && act->sa_handler != SIG_DFL) {
+        return KERR_EINVAL;
+    }
+    self->signal_handler[sig] = act->sa_handler;
+    self->signal_flags[sig] = (uint32_t)(act->sa_flags &
+                                         (SA_RESTART | SA_RESTORER |
+                                          SA_NODEFER | SA_RESETHAND |
+                                          SA_NOCLDSTOP | SA_NOCLDWAIT));
+    self->signal_restorer[sig] = act->sa_restorer;
+    self->signal_action_mask[sig] = (uint32_t)(act->sa_mask & 0x7FFFFFFFUL);
+    return 0;
+}
+
+int task_sigprocmask(int how, uint64_t set, uint64_t *oldset) {
+    task_t *self = current_task_ptr;
+    if (!self) {
+        return KERR_EINVAL;
+    }
+    if (oldset) {
+        *oldset = self->signal_mask;
+    }
+    if (how != SIG_BLOCK && how != SIG_UNBLOCK && how != SIG_SETMASK) {
+        return KERR_EINVAL;
+    }
+    uint32_t newmask = self->signal_mask;
+    uint32_t set32 = (uint32_t)set;
+    if (how == SIG_BLOCK) {
+        newmask |= set32;
+    } else if (how == SIG_UNBLOCK) {
+        newmask &= ~set32;
+    } else {
+        newmask = set32;
+    }
+    newmask &= ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
+    self->signal_mask = newmask;
+    return 0;
+}
+
+int task_sigreturn(trapframe_t *tf) {
+    task_t *self = current_task_ptr;
+    if (!self || !tf || !self->signal_active) {
+        return KERR_EINVAL;
+    }
+    *tf = self->signal_saved_tf;
+    self->signal_mask = self->signal_saved_mask;
+    self->signal_active = false;
+    self->signal_active_num = 0;
+    self->signal_saved_mask = 0U;
+    return (int)tf->x[0];
 }
 
 void task_yield(void) {
@@ -1518,22 +2398,31 @@ int task_fd_alloc(task_t *task) {
     return -1;
 }
 
-void task_fd_close(task_t *task, int fd) {
+int task_fd_close(task_t *task, int fd) {
     if (!task || fd < 0 || fd >= MAX_FDS) {
-        return;
+        return -1;
     }
     if (!task->fds[fd].used) {
-        return;
+        return -1;
     }
+    int rc = 0;
+    fd_t closing = task->fds[fd];
+    if (task_fd_needs_writeback(&closing)) {
+        if (pagecache_flush_inode(closing.inode) != 0) {
+            rc = -1;
+        }
+    }
+
     const void *wait_obj = 0;
-    if (task->fds[fd].kind == FD_PIPE_R || task->fds[fd].kind == FD_PIPE_W) {
-        wait_obj = task->fds[fd].pipe;
+    if (closing.kind == FD_PIPE_R || closing.kind == FD_PIPE_W) {
+        wait_obj = closing.pipe;
     }
-    task_fd_drop(&task->fds[fd]);
+    task_fd_drop(&closing);
     memset(&task->fds[fd], 0, sizeof(task->fds[fd]));
     if (wait_obj) {
         task_wake_pipe(wait_obj);
     }
+    return rc;
 }
 
 int task_fd_dup2(task_t *task, int oldfd, int newfd) {
@@ -1840,6 +2729,10 @@ static bool task_page_set_prot(task_t *t, user_page_t *up, int prot) {
             up->pa = (uint64_t)new_page;
         }
         up->writable_intent = true;
+        if (map_shared && vma && vma->inode) {
+            uint64_t file_off = vma->file_offset + (up->va - vma->start);
+            pagecache_mark_dirty(vma->inode, file_off, PAGE_SIZE);
+        }
     } else {
         up->writable_intent = false;
     }
@@ -1879,7 +2772,8 @@ long task_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_
             return -1;
         }
         fd_t *f = &t->fds[fd];
-        if (f->kind != FD_INODE || !f->inode || f->inode->type != INODE_FILE) {
+        if (f->kind != FD_INODE || !f->inode ||
+            (f->inode->type != INODE_FILE && !fs_is_block_dev(f->inode))) {
             return -1;
         }
         int mode = task_fd_mode(f->flags);
@@ -1911,7 +2805,7 @@ long task_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_
         }
         start = addr;
         uint64_t end = start + map_len;
-        if (end <= start || start < floor || end > top) {
+        if (end <= start || start < USER_VA_BASE || end > top) {
             return -1;
         }
         if (!task_vma_unmap_range(t, start, end, false)) {
@@ -2048,6 +2942,86 @@ int task_mprotect(uint64_t addr, uint64_t len, int prot) {
     return 0;
 }
 
+int task_msync(uint64_t addr, uint64_t len, uint64_t flags) {
+    task_t *t = current_task_ptr;
+    if (!t || len == 0U || (addr & (PAGE_SIZE - 1U)) != 0U) {
+        return -1;
+    }
+    if ((flags & ~(MS_ASYNC | MS_INVALIDATE | MS_SYNC)) != 0U) {
+        return -1;
+    }
+    uint64_t mode = flags & (MS_ASYNC | MS_SYNC);
+    if (mode == (MS_ASYNC | MS_SYNC)) {
+        return -1;
+    }
+    if (mode == 0U) {
+        flags |= MS_ASYNC;
+    }
+
+    uint64_t start = addr;
+    uint64_t raw_end = addr + len;
+    if (raw_end < addr) {
+        return -1;
+    }
+    uint64_t end = align_up(raw_end, PAGE_SIZE);
+    if (end <= start) {
+        return -1;
+    }
+    if (!task_vma_range_mapped(t, start, end)) {
+        return -1;
+    }
+
+    inode_t *synced[MAX_VMAS];
+    uint32_t synced_count = 0U;
+    memset(synced, 0, sizeof(synced));
+
+    for (int i = 0; i < MAX_VMAS; i++) {
+        vm_area_t *v = &t->vmas[i];
+        if (!v->used || end <= v->start || start >= v->end) {
+            continue;
+        }
+        if ((v->flags & MAP_SHARED) == 0 || !v->inode ||
+            (v->inode->type != INODE_FILE && !fs_is_block_dev(v->inode))) {
+            continue;
+        }
+
+        uint64_t ov_start = start > v->start ? start : v->start;
+        uint64_t ov_end = end < v->end ? end : v->end;
+        if (ov_start >= ov_end) {
+            continue;
+        }
+        uint64_t file_off = v->file_offset + (ov_start - v->start);
+        uint64_t span = ov_end - ov_start;
+        if (pagecache_flush_inode_range(v->inode, file_off, span) != 0) {
+            return -1;
+        }
+        if (flags & MS_INVALIDATE) {
+            if (pagecache_invalidate_inode_range(v->inode, file_off, span) != 0) {
+                return -1;
+            }
+        }
+
+        if (flags & MS_SYNC) {
+            bool seen = false;
+            for (uint32_t s = 0; s < synced_count; s++) {
+                if (synced[s] == v->inode) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                if (fs_sync_inode(v->inode) != 0) {
+                    return -1;
+                }
+                if (synced_count < MAX_VMAS) {
+                    synced[synced_count++] = v->inode;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 bool task_handle_page_fault(uint64_t fault_va, bool is_write, bool is_translation,
                             bool is_instruction, uint64_t user_sp) {
     task_t *t = current_task_ptr;
@@ -2103,24 +3077,32 @@ bool task_handle_page_fault(uint64_t fault_va, bool is_write, bool is_translatio
             if (t->stack_mapped_bottom <= t->stack_base) {
                 return false;
             }
-            uint64_t guard_page = t->stack_mapped_bottom - PAGE_SIZE;
-            if (va_page != guard_page) {
-                return false;
-            }
             if (user_sp < t->stack_base || user_sp >= USER_STACK_TOP) {
                 return false;
             }
+            if (fault_va + (2U * PAGE_SIZE) + STACK_GROW_SLOP < user_sp) {
+                return false;
+            }
             uint64_t sp_page = align_down(user_sp, PAGE_SIZE);
-            if (sp_page != va_page) {
+            if (sp_page < t->stack_base || sp_page >= USER_STACK_TOP) {
                 return false;
             }
-            if (fault_va + STACK_GROW_SLOP < user_sp) {
+            if (va_page >= t->stack_mapped_bottom) {
                 return false;
             }
-            if (!task_map_user_anon_fault_page(t, va_page, true, false)) {
-                return false;
+
+            uint64_t need_bottom = va_page;
+            if (sp_page < need_bottom) {
+                need_bottom = sp_page;
             }
-            t->stack_mapped_bottom = va_page;
+
+            while (t->stack_mapped_bottom > need_bottom) {
+                uint64_t next_page = t->stack_mapped_bottom - PAGE_SIZE;
+                if (!task_map_user_anon_fault_page(t, next_page, true, false)) {
+                    return false;
+                }
+                t->stack_mapped_bottom = next_page;
+            }
             return true;
         }
         return false;
@@ -2182,4 +3164,75 @@ void task_dump(void) {
         }
     }
     uart_puts("\n");
+}
+
+void task_set_comm(task_t *task, const char *name) {
+    task_set_comm_internal(task, name);
+}
+
+const char *task_comm(const task_t *task) {
+    if (!task) {
+        return "";
+    }
+    return task->comm;
+}
+
+void task_load_debug_symbols(task_t *task, const uint8_t *elf, size_t elf_size) {
+    if (!task) {
+        return;
+    }
+    task_debug_syms_clear(task);
+    if (!elf || elf_size < sizeof(Elf64_Ehdr)) {
+        return;
+    }
+
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)(const void *)elf;
+    if (eh->e_ident[EI_MAG0] != ELFMAG0 ||
+        eh->e_ident[EI_MAG1] != ELFMAG1 ||
+        eh->e_ident[EI_MAG2] != ELFMAG2 ||
+        eh->e_ident[EI_MAG3] != ELFMAG3 ||
+        eh->e_ident[EI_CLASS] != ELFCLASS64 ||
+        eh->e_machine != EM_AARCH64) {
+        return;
+    }
+    task_debug_syms_load(task, elf, elf_size, eh);
+}
+
+bool task_symbolize_pc(const task_t *task, uint64_t pc, const char **name_out,
+                       uint64_t *sym_start_out, uint64_t *sym_end_out) {
+    if (!task || task->debug_sym_count == 0U) {
+        return false;
+    }
+
+    int best = -1;
+    for (uint16_t i = 0; i < task->debug_sym_count; i++) {
+        const task_debug_sym_t *s = &task->debug_syms[i];
+        if (!s->used || s->name[0] == '\0' || pc < s->start) {
+            continue;
+        }
+        if (pc < s->end) {
+            if (best < 0 || s->start >= task->debug_syms[best].start) {
+                best = (int)i;
+            }
+            continue;
+        }
+        if (best < 0 || s->start > task->debug_syms[best].start) {
+            best = (int)i;
+        }
+    }
+
+    if (best < 0) {
+        return false;
+    }
+    const task_debug_sym_t *sym = &task->debug_syms[best];
+    if (name_out) {
+        *name_out = sym->name;
+    }
+    if (sym_start_out) {
+        *sym_start_out = sym->start;
+    }
+    if (sym_end_out) {
+        *sym_end_out = sym->end;
+    }
+    return true;
 }

@@ -14,6 +14,7 @@
 #define AHCI_PRDT_MAX           32U
 #define AHCI_MAX_PRDT_BYTES     (4U * 1024U * 1024U)
 #define AHCI_CMD_TIMEOUT_DIV    4U
+#define AHCI_IRQ_FALLBACK_SPINS 256U
 
 #define AHCI_PCI_BAR5           0x24U
 
@@ -122,6 +123,10 @@ typedef struct {
     uint64_t sectors;
     uint32_t fail_streak;
     uint64_t timeout_cycles;
+    uint32_t timeout_errors;
+    uint32_t tfes_errors;
+    uint32_t busy_errors;
+    uint32_t recoveries;
     volatile hba_port_t *regs;
     hba_cmd_header_t *clb;
     void *fb;
@@ -440,6 +445,7 @@ static bool ahci_issue_cmd(ahci_disk_t *d, uint8_t ata_cmd, uint64_t lba, uint16
     hba_cmd_table_t *tbl;
     uint64_t deadline;
     uint32_t seen_irq;
+    uint32_t irq_wait_spins = 0U;
     uint64_t seq;
 
     if (!d || !d->configured || !d->regs || !d->clb || !d->ctba) {
@@ -556,10 +562,16 @@ static bool ahci_issue_cmd(ahci_disk_t *d, uint8_t ata_cmd, uint64_t lba, uint16
             return false;
         }
         if (g_irq && g_irq_events == seen_irq) {
-            __asm__ volatile("yield");
+            if (++irq_wait_spins < AHCI_IRQ_FALLBACK_SPINS) {
+                __asm__ volatile("yield");
+                continue;
+            }
+            irq_wait_spins = 0U;
         } else {
             seen_irq = g_irq_events;
+            irq_wait_spins = 0U;
         }
+        __asm__ volatile("yield");
     }
 
     if ((p->is & HBA_PxIS_TFES) != 0U) {
@@ -593,6 +605,27 @@ static bool ahci_cmd_with_retry(ahci_disk_t *d, uint8_t ata_cmd, uint64_t lba,
     }
 
     if (st == AHCI_CMD_TIMEOUT) {
+        d->timeout_errors++;
+    } else if (st == AHCI_CMD_TFES) {
+        d->tfes_errors++;
+    } else if (st == AHCI_CMD_BUSY) {
+        d->busy_errors++;
+    }
+    if ((d->timeout_errors + d->tfes_errors + d->busy_errors) % 16U == 1U) {
+        uart_puts("[ahci] cmd err port=");
+        print_dec((int)d->port);
+        uart_puts(" st=");
+        print_dec((int)st);
+        uart_puts(" to=");
+        print_dec((int)d->timeout_errors);
+        uart_puts(" tfes=");
+        print_dec((int)d->tfes_errors);
+        uart_puts(" busy=");
+        print_dec((int)d->busy_errors);
+        uart_puts("\n");
+    }
+
+    if (st == AHCI_CMD_TIMEOUT) {
         if (d->fail_streak < 8U) {
             d->fail_streak++;
         }
@@ -620,10 +653,24 @@ static bool ahci_cmd_with_retry(ahci_disk_t *d, uint8_t ata_cmd, uint64_t lba,
     }
 
     if (!ahci_issue_cmd(d, ata_cmd, lba, count, buf, write, data_phase, &st)) {
-        return false;
+        if (!ahci_hba_reset()) {
+            return false;
+        }
+        for (uint32_t i = 0; i < g_disk_count; i++) {
+            if (!g_disks[i].configured || !ahci_port_rebase(&g_disks[i])) {
+                return false;
+            }
+        }
+        if (!ahci_port_comreset(d->regs)) {
+            return false;
+        }
+        if (!ahci_issue_cmd(d, ata_cmd, lba, count, buf, write, data_phase, &st)) {
+            return false;
+        }
     }
     d->fail_streak = 0U;
     d->timeout_cycles = g_io_timeout_cycles;
+    d->recoveries++;
     return true;
 }
 

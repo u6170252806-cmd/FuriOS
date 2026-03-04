@@ -17,7 +17,9 @@
 .set TF_SP_EL0,  248
 .set TF_ELR_EL1, 256
 .set TF_SPSR_EL1,264
-.set TF_SIZE,    272
+.set TF_TPIDR_EL0,272
+.set TF_RESERVED0,280
+.set TF_SIZE,    288
 
 .macro SAVE_TF
     sub sp, sp, #TF_SIZE
@@ -44,6 +46,8 @@
     str x1, [sp, #TF_ELR_EL1]
     mrs x1, spsr_el1
     str x1, [sp, #TF_SPSR_EL1]
+    mrs x1, tpidr_el0
+    str x1, [sp, #TF_TPIDR_EL0]
 .endm
 
 .macro RESTORE_FROM_X0
@@ -56,6 +60,8 @@
     msr elr_el1, x1
     ldr x1, [x9, #TF_SPSR_EL1]
     msr spsr_el1, x1
+    ldr x1, [x9, #TF_TPIDR_EL0]
+    msr tpidr_el0, x1
 
     ldp x0,  x1,  [x9, #TF_X0]
     ldp x2,  x3,  [x9, #TF_X2]
@@ -167,6 +173,8 @@ trap_enter_first:
     msr elr_el1, x2
     ldr x2, [x9, #TF_SPSR_EL1]
     msr spsr_el1, x2
+    ldr x2, [x9, #TF_TPIDR_EL0]
+    msr tpidr_el0, x2
 
     ldp x0,  x1,  [x9, #TF_X0]
     ldp x2,  x3,  [x9, #TF_X2]
