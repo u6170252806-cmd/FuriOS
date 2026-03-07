@@ -19,5 +19,7 @@ void pagecache_tick(uint64_t now_ticks);
 void pagecache_overlay_read(inode_t *inode, size_t file_off, void *buf, size_t len);
 void pagecache_notify_write(inode_t *inode, size_t file_off, const void *buf, size_t len);
 void pagecache_invalidate_inode(inode_t *inode);
+void pagecache_invalidate_ext4_all(void);
+void pagecache_truncate_inode(inode_t *inode, size_t new_size);
 
 #endif

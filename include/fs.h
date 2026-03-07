@@ -38,6 +38,7 @@ typedef enum {
     DEV_SDH = 12,
     DEV_NVME_BASE = 13,
     DEV_NVME_LAST = DEV_NVME_BASE + (NVME_MAX_CONTROLLERS * NVME_MAX_NAMESPACES) - 1,
+    DEV_NET0 = DEV_NVME_LAST + 1,
 } dev_kind_t;
 
 typedef struct inode inode_t;
@@ -46,6 +47,7 @@ struct inode {
     char name[INODE_NAME_MAX + 1];
     inode_type_t type;
     fs_kind_t fs_kind;
+    uint32_t fs_id;
     uint32_t fs_ino;
     bool executable;
     bool writable;

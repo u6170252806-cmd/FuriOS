@@ -12,6 +12,7 @@
 #define KERNEL_HIGH_BASE       0xFFFFFF8000000000UL
 
 #define UART0_BASE             0x09000000UL
+#define UART_IRQ               33U
 #define VIRTIO_MMIO0_BASE      0x0A000000UL
 #define VIRTIO_MMIO_STRIDE     0x00000200UL
 #define VIRTIO_MMIO_SLOTS      32U
@@ -35,7 +36,7 @@
 #define MAX_FDS                16
 #define MAX_PATH               128
 #define MAX_ARGV               16
-#define MAX_ARG_LEN            64
+#define MAX_ARG_LEN            256
 #define MAX_USER_PAGES         512
 #define MAX_VMAS               64
 #define MAX_FILE_CACHE_PAGES   256

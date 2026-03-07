@@ -48,7 +48,19 @@
     X(SYS_MSYNC, 41, "msync", 3) \
     X(SYS_SIGACTION, 42, "sigaction", 3) \
     X(SYS_SIGPROCMASK, 43, "sigprocmask", 3) \
-    X(SYS_SIGRETURN, 44, "sigreturn", 0)
+    X(SYS_SIGRETURN, 44, "sigreturn", 0) \
+    X(SYS_SOCKET, 45, "socket", 3) \
+    X(SYS_BIND, 46, "bind", 3) \
+    X(SYS_SENDTO, 47, "sendto", 6) \
+    X(SYS_RECVFROM, 48, "recvfrom", 6) \
+    X(SYS_SETSOCKOPT, 49, "setsockopt", 5) \
+    X(SYS_CONNECT, 50, "connect", 3) \
+    X(SYS_LISTEN, 51, "listen", 2) \
+    X(SYS_ACCEPT, 52, "accept", 3) \
+    X(SYS_GETSOCKNAME, 53, "getsockname", 3) \
+    X(SYS_GETPEERNAME, 54, "getpeername", 3) \
+    X(SYS_SHUTDOWN, 55, "shutdown", 2) \
+    X(SYS_GETSOCKOPT, 56, "getsockopt", 5)
 
 enum {
 #define X(sym, nr, name, argc) sym = nr,
@@ -77,6 +89,7 @@ enum {
 #define SIGINT   2
 #define SIGQUIT  3
 #define SIGKILL  9
+#define SIGPIPE  13
 #define SIGTERM  15
 #define SIGCHLD  17
 #define SIGCONT  18
@@ -115,6 +128,30 @@ enum {
 #define POLLERR  0x0008
 #define POLLHUP  0x0010
 #define POLLNVAL 0x0020
+
+#define AF_INET 2
+
+#define SOCK_STREAM 1
+#define SOCK_DGRAM  2
+#define SOCK_NONBLOCK 0x800
+
+#define SOL_SOCKET 1
+#define SO_REUSEADDR 2
+#define SO_ERROR 4
+#define SO_BROADCAST 6
+
+#define IPPROTO_IP  0
+#define IPPROTO_ICMP 1
+#define IPPROTO_TCP 6
+#define IPPROTO_UDP 17
+
+#define MSG_DONTWAIT 0x40
+
+#define SHUT_RD   0
+#define SHUT_WR   1
+#define SHUT_RDWR 2
+
+#define SOMAXCONN 8
 
 #define SEEK_SET 0
 #define SEEK_CUR 1
@@ -173,5 +210,17 @@ typedef struct {
     uint64_t sa_restorer;
     uint64_t sa_mask;
 } fu_sigaction_t;
+
+typedef struct {
+    uint16_t sa_family;
+    char sa_data[14];
+} fu_sockaddr_t;
+
+typedef struct {
+    uint16_t sin_family;
+    uint16_t sin_port;
+    uint32_t sin_addr;
+    uint8_t sin_zero[8];
+} fu_sockaddr_in_t;
 
 #endif

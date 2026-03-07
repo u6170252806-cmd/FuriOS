@@ -136,6 +136,7 @@ typedef struct {
 #define DT_INIT 12
 #define DT_FINI 13
 #define DT_RPATH 15
+#define DT_SYMBOLIC 16
 #define DT_REL 17
 #define DT_RELSZ 18
 #define DT_RELENT 19
@@ -202,6 +203,7 @@ typedef struct {
 #define PF_W 2
 #define PF_R 4
 
+#define DF_SYMBOLIC 0x00000002
 #define DF_TEXTREL 0x00000004
 
 #define ELF64_R_SYM(info) ((uint32_t)((info) >> 32))

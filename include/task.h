@@ -33,12 +33,14 @@ typedef enum {
     FD_INODE,
     FD_PIPE_R,
     FD_PIPE_W,
+    FD_SOCKET,
 } fd_kind_t;
 
 typedef struct {
     fd_kind_t kind;
     inode_t *inode;
     pipe_t *pipe;
+    void *sock;
     size_t offset;
     int flags;
     bool used;
@@ -173,6 +175,7 @@ long task_brk(uint64_t new_break);
 bool task_mount_busy(const inode_t *mountpoint, const char *mount_path);
 bool task_handle_page_fault(uint64_t fault_va, bool is_write, bool is_translation,
                             bool is_instruction, uint64_t user_sp);
+bool task_pagecache_writeprotect_shared(inode_t *inode, uint64_t file_off);
 void task_set_comm(task_t *task, const char *name);
 const char *task_comm(const task_t *task);
 bool task_symbolize_pc(const task_t *task, uint64_t pc, const char **name_out,
