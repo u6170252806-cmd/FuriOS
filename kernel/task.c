@@ -10,6 +10,7 @@
 #include "uart.h"
 #include "timer.h"
 #include "pagecache.h"
+#include "net.h"
 
 extern void trap_enter_first(trapframe_t *tf, uint64_t ttbr0);
 
@@ -299,24 +300,46 @@ static trapframe_t *task_kstack_tf(task_t *t) {
 }
 
 static void task_fd_ref(const fd_t *fd) {
-    if (!fd || !fd->used || !fd->pipe) {
+    if (!fd || !fd->used) {
         return;
     }
     if (fd->kind == FD_PIPE_R) {
+        if (!fd->pipe) {
+            return;
+        }
         pipe_ref_read(fd->pipe);
     } else if (fd->kind == FD_PIPE_W) {
+        if (!fd->pipe) {
+            return;
+        }
         pipe_ref_write(fd->pipe);
+    } else if (fd->kind == FD_SOCKET) {
+        if (!fd->sock) {
+            return;
+        }
+        net_socket_ref(fd->sock);
     }
 }
 
 static void task_fd_drop(const fd_t *fd) {
-    if (!fd || !fd->used || !fd->pipe) {
+    if (!fd || !fd->used) {
         return;
     }
     if (fd->kind == FD_PIPE_R) {
+        if (!fd->pipe) {
+            return;
+        }
         pipe_close_read(fd->pipe);
     } else if (fd->kind == FD_PIPE_W) {
+        if (!fd->pipe) {
+            return;
+        }
         pipe_close_write(fd->pipe);
+    } else if (fd->kind == FD_SOCKET) {
+        if (!fd->sock) {
+            return;
+        }
+        net_socket_close(fd->sock);
     }
 }
 
@@ -380,6 +403,25 @@ static vm_area_t *task_vma_find(task_t *t, uint64_t va) {
         }
     }
     return 0;
+}
+
+static bool task_inode_same_file(const inode_t *a, const inode_t *b) {
+    if (a == b) {
+        return true;
+    }
+    if (!a || !b || a->type != b->type || a->fs_kind != b->fs_kind) {
+        return false;
+    }
+    if (a->type == INODE_DEV) {
+        return a->dev_kind == b->dev_kind &&
+               a->dev_lba_start == b->dev_lba_start &&
+               a->dev_lba_count == b->dev_lba_count;
+    }
+    if (a->fs_kind == FS_KIND_EXT4 && a->fs_id != 0U && b->fs_id != 0U &&
+        a->fs_ino != 0U && b->fs_ino != 0U) {
+        return a->fs_id == b->fs_id && a->fs_ino == b->fs_ino;
+    }
+    return false;
 }
 
 static bool task_vma_overlaps(task_t *t, uint64_t start, uint64_t end) {
@@ -475,6 +517,7 @@ static task_t *task_alloc(void) {
                 tasks[i].fds[fd].kind = FD_NONE;
                 tasks[i].fds[fd].inode = 0;
                 tasks[i].fds[fd].pipe = 0;
+                tasks[i].fds[fd].sock = 0;
                 if (fd == 0) {
                     tasks[i].fds[fd].flags = O_RDONLY;
                 } else {
@@ -812,8 +855,8 @@ static bool task_map_user_anon_fault_page(task_t *t, uint64_t va, bool writable,
     return true;
 }
 
-static bool task_vma_writeback_page(const vm_area_t *v, const user_page_t *up) {
-    if (!v || !up || !v->used || !v->inode) {
+static bool task_vma_writeback_page(task_t *t, const vm_area_t *v, const user_page_t *up) {
+    if (!t || !v || !up || !v->used || !v->inode) {
         return true;
     }
     if ((v->flags & MAP_SHARED) == 0) {
@@ -825,6 +868,19 @@ static bool task_vma_writeback_page(const vm_area_t *v, const user_page_t *up) {
     }
     if (up->va < v->start || up->va >= v->end) {
         return false;
+    }
+    bool hw_writable = false;
+    bool hw_executable = false;
+    bool hw_cow = false;
+    if (!task_page_validate_hw(t, up, 0, &hw_writable, &hw_executable, &hw_cow)) {
+        return false;
+    }
+    (void)hw_executable;
+    if (hw_cow) {
+        return false;
+    }
+    if (!hw_writable) {
+        return true;
     }
 
     uint64_t map_off = up->va - v->start;
@@ -849,12 +905,9 @@ static bool task_map_user_file_fault_page(task_t *t, const vm_area_t *v, uint64_
         if (!pagecache_get_or_create(v->inode, file_off, &pa)) {
             return false;
         }
-        if (!task_map_user_page(t, va, pa, writable, executable, false, writable)) {
+        if (!task_map_user_page(t, va, pa, false, executable, false, writable)) {
             pmm_free_page((void *)pa);
             return false;
-        }
-        if (writable) {
-            pagecache_mark_dirty(v->inode, file_off, PAGE_SIZE);
         }
         mmu_tlb_flush_va(va, t->asid);
         return true;
@@ -899,7 +952,7 @@ static bool task_unmap_user_page(task_t *t, uint64_t va_page) {
     }
 
     vm_area_t *v = task_vma_find(t, va_page);
-    if (v && !task_vma_writeback_page(v, up)) {
+    if (v && !task_vma_writeback_page(t, v, up)) {
         return false;
     }
 
@@ -916,7 +969,7 @@ static void task_unmap_user(task_t *t) {
     for (int i = 0; i < MAX_USER_PAGES; i++) {
         if (t->pages[i].used) {
             vm_area_t *v = task_vma_find(t, t->pages[i].va);
-            (void)task_vma_writeback_page(v, &t->pages[i]);
+            (void)task_vma_writeback_page(t, v, &t->pages[i]);
             pmm_free_page((void *)t->pages[i].pa);
         }
     }
@@ -1037,6 +1090,11 @@ static bool task_signal_enqueue(task_t *t, int sig) {
     if (!t || sig <= 0 || sig >= 32) {
         return false;
     }
+    if (sig == SIGCONT) {
+        task_signal_clear_pending(t, SIGSTOP);
+    } else if (sig == SIGSTOP) {
+        task_signal_clear_pending(t, SIGCONT);
+    }
 
     uint32_t bit = SIGBIT(sig);
     if ((t->pending_signals & bit) != 0U) {
@@ -1087,6 +1145,19 @@ static bool task_sigchld_auto_reap(const task_t *parent) {
     return (parent->signal_flags[SIGCHLD] & SA_NOCLDWAIT) != 0U;
 }
 
+static void task_reap_sigchld_zombies(task_t *parent) {
+    if (!task_sigchld_auto_reap(parent)) {
+        return;
+    }
+    for (int i = 0; i < MAX_TASKS; i++) {
+        task_t *child = &tasks[i];
+        if (child->state != TASK_ZOMBIE || child->ppid != parent->pid) {
+            continue;
+        }
+        task_reap_slot(child);
+    }
+}
+
 static void task_reparent_children(int old_ppid) {
     if (old_ppid <= 0) {
         return;
@@ -1099,7 +1170,25 @@ static void task_reparent_children(int old_ppid) {
             continue;
         }
         child->ppid = new_ppid;
-        if (new_ppid > 0 && child->state == TASK_ZOMBIE) {
+        if (new_ppid <= 0 || !init) {
+            continue;
+        }
+        if (child->state == TASK_ZOMBIE) {
+            if (task_sigchld_auto_reap(init)) {
+                task_reap_slot(child);
+                continue;
+            }
+            task_notify_sigchld(child, TASK_CHLD_EXIT);
+            task_wake_waiters(child->pid);
+            continue;
+        }
+        if (child->state == TASK_STOPPED && child->stop_report_pending) {
+            task_notify_sigchld(child, TASK_CHLD_STOP);
+            task_wake_waiters(child->pid);
+            continue;
+        }
+        if (child->cont_report_pending) {
+            task_notify_sigchld(child, TASK_CHLD_CONT);
             task_wake_waiters(child->pid);
         }
     }
@@ -2029,7 +2118,7 @@ int task_getpgid(int pid) {
 
 static bool task_signal_supported(int sig) {
     return sig == 0 || sig == SIGHUP || sig == SIGINT || sig == SIGQUIT ||
-           sig == SIGTERM || sig == SIGKILL || sig == SIGSTOP ||
+           sig == SIGPIPE || sig == SIGTERM || sig == SIGKILL || sig == SIGSTOP ||
            sig == SIGCONT || sig == SIGCHLD;
 }
 
@@ -2050,6 +2139,7 @@ static task_sig_default_action_t task_signal_default_action(int sig) {
             return TASK_SIG_DFL_CONT;
         case SIGHUP:
         case SIGINT:
+        case SIGPIPE:
         case SIGQUIT:
         case SIGTERM:
         case SIGKILL:
@@ -2122,6 +2212,7 @@ static int task_signal_one(task_t *self, task_t *victim, int sig) {
     }
 
     if (sig == SIGCONT) {
+        task_signal_clear_pending(victim, SIGSTOP);
         if (victim->state == TASK_STOPPED) {
             victim->state = TASK_RUNNABLE;
             victim->cont_report_pending = true;
@@ -2135,6 +2226,7 @@ static int task_signal_one(task_t *self, task_t *victim, int sig) {
     }
 
     if (sig == SIGSTOP) {
+        task_signal_clear_pending(victim, SIGCONT);
         if (victim->state != TASK_STOPPED) {
             victim->state = TASK_STOPPED;
             victim->wait_pid = -1;
@@ -2336,6 +2428,12 @@ int task_sigaction(int sig, const fu_sigaction_t *act, fu_sigaction_t *oldact) {
                                           SA_NOCLDSTOP | SA_NOCLDWAIT));
     self->signal_restorer[sig] = act->sa_restorer;
     self->signal_action_mask[sig] = (uint32_t)(act->sa_mask & 0x7FFFFFFFUL);
+    if (sig == SIGCHLD) {
+        task_reap_sigchld_zombies(self);
+        if (!task_parent_has_child_sigchld_event(self)) {
+            task_signal_clear_pending(self, SIGCHLD);
+        }
+    }
     return 0;
 }
 
@@ -2391,6 +2489,7 @@ int task_fd_alloc(task_t *task) {
             task->fds[fd].offset = 0;
             task->fds[fd].inode = 0;
             task->fds[fd].pipe = 0;
+            task->fds[fd].sock = 0;
             task->fds[fd].flags = 0;
             return fd;
         }
@@ -2710,6 +2809,7 @@ static bool task_page_set_prot(task_t *t, user_page_t *up, int prot) {
 
     vm_area_t *vma = task_vma_find(t, up->va);
     bool map_shared = vma && ((vma->flags & MAP_SHARED) != 0);
+    bool pte_writable = false;
 
     if (prot & PROT_WRITE) {
         uint32_t refs = pmm_page_refcount((void *)up->pa);
@@ -2729,15 +2829,14 @@ static bool task_page_set_prot(task_t *t, user_page_t *up, int prot) {
             up->pa = (uint64_t)new_page;
         }
         up->writable_intent = true;
-        if (map_shared && vma && vma->inode) {
-            uint64_t file_off = vma->file_offset + (up->va - vma->start);
-            pagecache_mark_dirty(vma->inode, file_off, PAGE_SIZE);
+        if (!map_shared) {
+            pte_writable = true;
         }
     } else {
         up->writable_intent = false;
     }
 
-    uint64_t attrs = task_user_attrs_prot(prot, false);
+    uint64_t attrs = task_user_attrs(pte_writable, (prot & PROT_EXEC) != 0, false);
     if (!task_set_user_pte(t, up->va, up->pa, attrs)) {
         return false;
     }
@@ -3022,6 +3121,53 @@ int task_msync(uint64_t addr, uint64_t len, uint64_t flags) {
     return 0;
 }
 
+bool task_pagecache_writeprotect_shared(inode_t *inode, uint64_t file_off) {
+    if (!inode) {
+        return true;
+    }
+    uint64_t page_off = align_down(file_off, PAGE_SIZE);
+    for (int ti = 0; ti < MAX_TASKS; ti++) {
+        task_t *t = &tasks[ti];
+        if (t->state == TASK_UNUSED || t->state == TASK_ZOMBIE) {
+            continue;
+        }
+        for (int pi = 0; pi < MAX_USER_PAGES; pi++) {
+            user_page_t *up = &t->pages[pi];
+            if (!up->used || !up->writable_intent) {
+                continue;
+            }
+            vm_area_t *v = task_vma_find(t, up->va);
+            if (!v || (v->flags & MAP_SHARED) == 0 || (v->prot & PROT_WRITE) == 0 ||
+                !v->inode || !task_inode_same_file(v->inode, inode)) {
+                continue;
+            }
+            uint64_t v_file_off = v->file_offset + (up->va - v->start);
+            if (v_file_off != page_off) {
+                continue;
+            }
+
+            bool hw_writable = false;
+            bool hw_executable = false;
+            bool hw_cow = false;
+            if (!task_page_validate_hw(t, up, 0, &hw_writable, &hw_executable, &hw_cow)) {
+                return false;
+            }
+            if (hw_cow) {
+                return false;
+            }
+            if (!hw_writable) {
+                continue;
+            }
+            if (!task_set_user_pte(t, up->va, up->pa,
+                                   task_user_attrs(false, hw_executable, false))) {
+                return false;
+            }
+            mmu_tlb_flush_va(up->va, t->asid);
+        }
+    }
+    return true;
+}
+
 bool task_handle_page_fault(uint64_t fault_va, bool is_write, bool is_translation,
                             bool is_instruction, uint64_t user_sp) {
     task_t *t = current_task_ptr;
@@ -3126,7 +3272,19 @@ bool task_handle_page_fault(uint64_t fault_va, bool is_write, bool is_translatio
         return false;
     }
     if (!hw_cow) {
-        return false;
+        vm_area_t *v = task_vma_find(t, va_page);
+        if (!v || (v->flags & MAP_SHARED) == 0 || (v->prot & PROT_WRITE) == 0 || !v->inode) {
+            return false;
+        }
+        uint64_t file_off = v->file_offset + (va_page - v->start);
+        pagecache_mark_dirty(v->inode, file_off, PAGE_SIZE);
+        if (!task_set_user_pte(t, va_page, up->pa,
+                               task_user_attrs(true, hw_executable, false))) {
+            return false;
+        }
+        mmu_tlb_flush_va(va_page, t->asid);
+        task_refresh_mem_accounting(t);
+        return true;
     }
     uint32_t refs = pmm_page_refcount((void *)up->pa);
     if (refs == 0) {

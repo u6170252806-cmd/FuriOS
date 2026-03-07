@@ -7,7 +7,7 @@ static int neg_errno(long rc) {
     return -1;
 }
 
-__attribute__((noreturn)) static void __sigreturn_trampoline(void) {
+__attribute__((noreturn)) void __sigreturn_trampoline(void) {
     (void)sys_sigreturn();
     for (;;) {
         __asm__ volatile("yield");
@@ -109,6 +109,68 @@ int poll(fu_pollfd_t *fds, int nfds, unsigned long timeout_ticks) {
     return (rc < 0) ? neg_errno(rc) : (int)rc;
 }
 
+int socket(int domain, int type, int protocol) {
+    long rc = sys_socket(domain, type, protocol);
+    return (rc < 0) ? neg_errno(rc) : (int)rc;
+}
+
+int bind(int fd, const fu_sockaddr_t *addr, unsigned long addrlen) {
+    long rc = sys_bind(fd, addr, addrlen);
+    return (rc < 0) ? neg_errno(rc) : 0;
+}
+
+long sendto(int fd, const void *buf, unsigned long len, int flags,
+            const fu_sockaddr_t *dest_addr, unsigned long addrlen) {
+    long rc = sys_sendto(fd, buf, len, flags, dest_addr, addrlen);
+    return (rc < 0) ? (long)neg_errno(rc) : rc;
+}
+
+long recvfrom(int fd, void *buf, unsigned long len, int flags,
+              fu_sockaddr_t *src_addr, unsigned long *addrlen) {
+    long rc = sys_recvfrom(fd, buf, len, flags, src_addr, addrlen);
+    return (rc < 0) ? (long)neg_errno(rc) : rc;
+}
+
+int setsockopt(int fd, int level, int optname, const void *optval, unsigned long optlen) {
+    long rc = sys_setsockopt(fd, level, optname, optval, optlen);
+    return (rc < 0) ? neg_errno(rc) : 0;
+}
+
+int getsockopt(int fd, int level, int optname, void *optval, unsigned long *optlen) {
+    long rc = sys_getsockopt(fd, level, optname, optval, optlen);
+    return (rc < 0) ? neg_errno(rc) : 0;
+}
+
+int connect(int fd, const fu_sockaddr_t *addr, unsigned long addrlen) {
+    long rc = sys_connect(fd, addr, addrlen);
+    return (rc < 0) ? neg_errno(rc) : 0;
+}
+
+int listen(int fd, int backlog) {
+    long rc = sys_listen(fd, backlog);
+    return (rc < 0) ? neg_errno(rc) : 0;
+}
+
+int accept(int fd, fu_sockaddr_t *addr, unsigned long *addrlen) {
+    long rc = sys_accept(fd, addr, addrlen);
+    return (rc < 0) ? neg_errno(rc) : (int)rc;
+}
+
+int getsockname(int fd, fu_sockaddr_t *addr, unsigned long *addrlen) {
+    long rc = sys_getsockname(fd, addr, addrlen);
+    return (rc < 0) ? neg_errno(rc) : 0;
+}
+
+int getpeername(int fd, fu_sockaddr_t *addr, unsigned long *addrlen) {
+    long rc = sys_getpeername(fd, addr, addrlen);
+    return (rc < 0) ? neg_errno(rc) : 0;
+}
+
+int shutdown(int fd, int how) {
+    long rc = sys_shutdown(fd, how);
+    return (rc < 0) ? neg_errno(rc) : 0;
+}
+
 int dup2(int oldfd, int newfd) {
     long rc = sys_dup2(oldfd, newfd);
     return (rc < 0) ? neg_errno(rc) : (int)rc;
@@ -155,6 +217,11 @@ int fork(void) {
 int execv(const char *path, const char *const argv[]) {
     long rc = sys_exec(path, argv);
     return (rc < 0) ? neg_errno(rc) : (int)rc;
+}
+
+int execve(const char *path, const char *const argv[], const char *const envp[]) {
+    (void)envp;
+    return execv(path, argv);
 }
 
 int waitpid(int pid, int *status, int options) {
@@ -242,5 +309,9 @@ void *sbrk(long increment) {
 }
 
 void exit(int code) {
+    sys_exit(code);
+}
+
+void _exit(int code) {
     sys_exit(code);
 }

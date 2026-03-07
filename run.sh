@@ -40,6 +40,14 @@ if [[ "$VIRTIO_ENABLED" -eq 1 ]]; then
   )
 fi
 
+QEMU_NET_ARGS=()
+if [[ -z "${DISABLE_NET:-}" ]]; then
+  NET_MODEL="${NET_MODEL:-rtl8139}"
+  if [[ -n "$NET_MODEL" && "$NET_MODEL" != "none" ]]; then
+    QEMU_NET_ARGS+=(-nic "user,model=${NET_MODEL}")
+  fi
+fi
+
 SSD_DISK_PATH="${SSD_DISK_PATH:-build/ssd.img}"
 SSD_DISK_SIZE="${SSD_DISK_SIZE:-256M}"
 AHCI_DISK_PATH="${AHCI_DISK_PATH:-$SSD_DISK_PATH}"
@@ -145,5 +153,6 @@ qemu-system-aarch64 \
   -smp 1 \
   -nographic \
   -monitor none \
+  "${QEMU_NET_ARGS[@]}" \
   "${QEMU_STORAGE_ARGS[@]}" \
   -device loader,file=build/kernel.elf,cpu-num=0

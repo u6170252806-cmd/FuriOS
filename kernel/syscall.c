@@ -10,6 +10,7 @@
 #include "pmm.h"
 #include "config.h"
 #include "pagecache.h"
+#include "net.h"
 
 #define EXEC_IMAGE_MAX (16U * 1024U * 1024U)
 
@@ -223,6 +224,62 @@ static int elf_interp_path(const uint8_t *image, size_t image_size, char *out, s
 }
 
 #define MAX_POLL_FDS 16
+#define SOCKADDR_IN_LEN 16U
+#define SYS_NET_UDP_PAYLOAD_MAX 1472U
+
+static uint16_t swab16(uint16_t v) {
+    return (uint16_t)((v << 8) | (v >> 8));
+}
+
+static uint32_t swab32(uint32_t v) {
+    return ((v & 0x000000FFU) << 24) |
+           ((v & 0x0000FF00U) << 8) |
+           ((v & 0x00FF0000U) >> 8) |
+           ((v & 0xFF000000U) >> 24);
+}
+
+static int copy_sockaddr_in_from_user(fu_sockaddr_in_t *out, const void *user_sa, uint64_t sa_len) {
+    if (!out || !user_sa || sa_len < SOCKADDR_IN_LEN) {
+        return -1;
+    }
+    if (copy_from_user(out, user_sa, sizeof(*out)) != 0) {
+        return -1;
+    }
+    if (out->sin_family != AF_INET) {
+        return -1;
+    }
+    return 0;
+}
+
+static int copy_sockaddr_in_to_user(uint64_t user_sa, uint64_t user_len_ptr,
+                                    uint32_t addr_be, uint16_t port_be) {
+    if (user_sa == 0 || user_len_ptr == 0) {
+        return 0;
+    }
+
+    uint64_t want_len = 0;
+    if (copy_from_user(&want_len, (const void *)user_len_ptr, sizeof(want_len)) != 0) {
+        return -1;
+    }
+
+    if (want_len >= SOCKADDR_IN_LEN) {
+        fu_sockaddr_in_t sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_port = port_be;
+        sa.sin_addr = swab32(addr_be);
+        if (copy_to_user((void *)user_sa, &sa, sizeof(sa)) != 0) {
+            return -1;
+        }
+        want_len = sizeof(sa);
+    } else {
+        want_len = 0;
+    }
+    if (copy_to_user((void *)user_len_ptr, &want_len, sizeof(want_len)) != 0) {
+        return -1;
+    }
+    return 0;
+}
 
 static long sys_write_impl(trapframe_t *tf, uint64_t fd, uint64_t buf, uint64_t len,
                            uint64_t a3, uint64_t a4, uint64_t a5) {
@@ -309,7 +366,11 @@ static long sys_write_impl(trapframe_t *tf, uint64_t fd, uint64_t buf, uint64_t 
             }
 
             if (!pipe_has_readers(f->pipe)) {
-                return done ? (long)done : -1;
+                if (done == 0U) {
+                    (void)task_kill(t->pid, SIGPIPE);
+                    return -32;
+                }
+                return (long)done;
             }
 
             size_t n = pipe_write(f->pipe, tmp, (size_t)chunk);
@@ -328,6 +389,18 @@ static long sys_write_impl(trapframe_t *tf, uint64_t fd, uint64_t buf, uint64_t 
             task_wake_pipe(f->pipe);
         }
         return (long)done;
+    }
+
+    if (f->kind == FD_SOCKET) {
+        if (!f->sock) {
+            return -1;
+        }
+        bool nonblock = (f->flags & O_NONBLOCK) != 0;
+        long rc = net_socket_write((net_socket_t *)f->sock, (const void *)buf, (size_t)len, nonblock);
+        if (rc == -32) {
+            (void)task_kill(t->pid, SIGPIPE);
+        }
+        return rc;
     }
 
     if (f->kind == FD_PIPE_R) {
@@ -445,6 +518,33 @@ static long sys_read_impl(trapframe_t *tf, uint64_t fd, uint64_t buf, uint64_t l
     if (f->kind == FD_PIPE_W) {
         return -1;
     }
+
+    if (f->kind == FD_SOCKET) {
+        if (!f->sock) {
+            return -1;
+        }
+        bool nonblock = (f->flags & O_NONBLOCK) != 0;
+        uint8_t tmp[256];
+        uint64_t done = 0;
+        while (done < len) {
+            uint64_t chunk = len - done;
+            if (chunk > sizeof(tmp)) {
+                chunk = sizeof(tmp);
+            }
+            long n = net_socket_read((net_socket_t *)f->sock, tmp, (size_t)chunk, nonblock);
+            if (n <= 0) {
+                return done ? (long)done : n;
+            }
+            if (copy_to_user(user_buf + done, tmp, (size_t)n) != 0) {
+                return done ? (long)done : -1;
+            }
+            done += (uint64_t)n;
+            if ((uint64_t)n < chunk) {
+                break;
+            }
+        }
+        return (long)done;
+    }
     return -1;
 }
 
@@ -514,6 +614,7 @@ static long sys_open_impl(trapframe_t *tf, uint64_t path, uint64_t flags, uint64
 
     t->fds[fd].inode = ino;
     t->fds[fd].pipe = 0;
+    t->fds[fd].sock = 0;
     t->fds[fd].kind = FD_INODE;
     t->fds[fd].flags = iflags;
     t->fds[fd].offset = (iflags & O_APPEND) ? ino->size : 0;
@@ -592,12 +693,14 @@ static long sys_pipe_impl(trapframe_t *tf, uint64_t user_fds, uint64_t a1, uint6
     t->fds[rfd].kind = FD_PIPE_R;
     t->fds[rfd].pipe = p;
     t->fds[rfd].inode = 0;
+    t->fds[rfd].sock = 0;
     t->fds[rfd].offset = 0;
     t->fds[rfd].flags = O_RDONLY;
 
     t->fds[wfd].kind = FD_PIPE_W;
     t->fds[wfd].pipe = p;
     t->fds[wfd].inode = 0;
+    t->fds[wfd].sock = 0;
     t->fds[wfd].offset = 0;
     t->fds[wfd].flags = O_WRONLY;
 
@@ -608,6 +711,374 @@ static long sys_pipe_impl(trapframe_t *tf, uint64_t user_fds, uint64_t a1, uint6
         return -1;
     }
     return 0;
+}
+
+static long sys_socket_impl(trapframe_t *tf, uint64_t domain, uint64_t type, uint64_t protocol,
+                            uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)tf;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+
+    task_t *t = task_current();
+    if (!t) {
+        return -1;
+    }
+
+    net_socket_t *sock = 0;
+    if (net_socket_create((int)domain, (int)type, (int)protocol, &sock) != 0 || !sock) {
+        return -1;
+    }
+
+    int fd = task_fd_alloc(t);
+    if (fd < 0) {
+        net_socket_close(sock);
+        return -1;
+    }
+
+    t->fds[fd].kind = FD_SOCKET;
+    t->fds[fd].inode = 0;
+    t->fds[fd].pipe = 0;
+    t->fds[fd].sock = sock;
+    t->fds[fd].offset = 0;
+    t->fds[fd].flags = O_RDWR;
+    if (((int)type & SOCK_NONBLOCK) != 0) {
+        t->fds[fd].flags |= O_NONBLOCK;
+    }
+    return fd;
+}
+
+static long sys_bind_impl(trapframe_t *tf, uint64_t fd, uint64_t addr, uint64_t addrlen,
+                          uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)tf;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+
+    task_t *t = task_current();
+    if (!t || fd >= MAX_FDS || !t->fds[fd].used) {
+        return -1;
+    }
+    fd_t *f = &t->fds[fd];
+    if (f->kind != FD_SOCKET || !f->sock) {
+        return -1;
+    }
+
+    fu_sockaddr_in_t sa;
+    if (copy_sockaddr_in_from_user(&sa, (const void *)addr, addrlen) != 0) {
+        return -1;
+    }
+
+    uint32_t ip_be = swab32(sa.sin_addr);
+    return net_socket_bind((net_socket_t *)f->sock, ip_be, sa.sin_port);
+}
+
+static long sys_sendto_impl(trapframe_t *tf, uint64_t fd, uint64_t buf, uint64_t len,
+                            uint64_t flags, uint64_t dest_addr, uint64_t addrlen) {
+    (void)tf;
+    (void)flags;
+
+    task_t *t = task_current();
+    if (!t || fd >= MAX_FDS || !t->fds[fd].used || buf == 0 || len > SYS_NET_UDP_PAYLOAD_MAX) {
+        return -1;
+    }
+    fd_t *f = &t->fds[fd];
+    if (f->kind != FD_SOCKET || !f->sock) {
+        return -1;
+    }
+
+    fu_sockaddr_in_t sa;
+    if (copy_sockaddr_in_from_user(&sa, (const void *)dest_addr, addrlen) != 0) {
+        return -1;
+    }
+
+    uint8_t tmp[SYS_NET_UDP_PAYLOAD_MAX];
+    if (len > 0 && copy_from_user(tmp, (const void *)buf, (size_t)len) != 0) {
+        return -1;
+    }
+
+    uint32_t dst_ip_be = swab32(sa.sin_addr);
+    return net_socket_sendto((net_socket_t *)f->sock, tmp, (size_t)len, dst_ip_be, sa.sin_port);
+}
+
+static long sys_recvfrom_impl(trapframe_t *tf, uint64_t fd, uint64_t buf, uint64_t len,
+                              uint64_t flags, uint64_t src_addr, uint64_t addrlen_ptr) {
+    (void)tf;
+
+    task_t *t = task_current();
+    if (!t || fd >= MAX_FDS || !t->fds[fd].used || buf == 0 || len > SYS_NET_UDP_PAYLOAD_MAX) {
+        return -1;
+    }
+    fd_t *f = &t->fds[fd];
+    if (f->kind != FD_SOCKET || !f->sock) {
+        return -1;
+    }
+
+    bool nonblock = (f->flags & O_NONBLOCK) != 0 || (flags & MSG_DONTWAIT) != 0;
+    uint8_t tmp[SYS_NET_UDP_PAYLOAD_MAX];
+    uint32_t src_ip_be = 0U;
+    uint16_t src_port_be = 0U;
+    long n = net_socket_recvfrom((net_socket_t *)f->sock, tmp, (size_t)len,
+                                 &src_ip_be, &src_port_be, nonblock);
+    if (n == -2) {
+        task_block_on_sleep(timer_ticks() + 1U);
+        return -2;
+    }
+    if (n < 0) {
+        return n;
+    }
+    if (n > 0 && copy_to_user((void *)buf, tmp, (size_t)n) != 0) {
+        return -1;
+    }
+
+    if (src_addr != 0 && addrlen_ptr != 0) {
+        uint64_t want_len = 0;
+        if (copy_from_user(&want_len, (const void *)addrlen_ptr, sizeof(want_len)) != 0) {
+            return -1;
+        }
+        if (want_len >= SOCKADDR_IN_LEN) {
+            fu_sockaddr_in_t sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.sin_family = AF_INET;
+            sa.sin_port = src_port_be;
+            sa.sin_addr = swab32(src_ip_be);
+            if (copy_to_user((void *)src_addr, &sa, sizeof(sa)) != 0) {
+                return -1;
+            }
+            want_len = sizeof(sa);
+        } else {
+            want_len = 0;
+        }
+        if (copy_to_user((void *)addrlen_ptr, &want_len, sizeof(want_len)) != 0) {
+            return -1;
+        }
+    }
+    return n;
+}
+
+static long sys_setsockopt_impl(trapframe_t *tf, uint64_t fd, uint64_t level, uint64_t optname,
+                                uint64_t optval, uint64_t optlen, uint64_t a5) {
+    (void)tf;
+    (void)a5;
+
+    task_t *t = task_current();
+    if (!t || fd >= MAX_FDS || !t->fds[fd].used || optval == 0 || optlen > 64U) {
+        return -1;
+    }
+    fd_t *f = &t->fds[fd];
+    if (f->kind != FD_SOCKET || !f->sock) {
+        return -1;
+    }
+
+    uint8_t tmp[64];
+    if (copy_from_user(tmp, (const void *)optval, (size_t)optlen) != 0) {
+        return -1;
+    }
+    return net_socket_setsockopt((net_socket_t *)f->sock, (int)level, (int)optname,
+                                 tmp, (size_t)optlen);
+}
+
+static long sys_getsockopt_impl(trapframe_t *tf, uint64_t fd, uint64_t level, uint64_t optname,
+                                uint64_t optval, uint64_t optlen_ptr, uint64_t a5) {
+    (void)tf;
+    (void)a5;
+
+    task_t *t = task_current();
+    if (!t || fd >= MAX_FDS || !t->fds[fd].used || optval == 0 || optlen_ptr == 0) {
+        return -1;
+    }
+    fd_t *f = &t->fds[fd];
+    if (f->kind != FD_SOCKET || !f->sock) {
+        return -1;
+    }
+
+    unsigned long user_optlen = 0;
+    if (copy_from_user(&user_optlen, (const void *)optlen_ptr, sizeof(user_optlen)) != 0 ||
+        user_optlen > 64U) {
+        return -1;
+    }
+
+    uint8_t tmp[64];
+    size_t koptlen = (size_t)user_optlen;
+    int rc = net_socket_getsockopt((net_socket_t *)f->sock, (int)level, (int)optname,
+                                   tmp, &koptlen);
+    if (rc != 0) {
+        return rc;
+    }
+    if (copy_to_user((void *)optval, tmp, koptlen) != 0) {
+        return -1;
+    }
+    user_optlen = (unsigned long)koptlen;
+    if (copy_to_user((void *)optlen_ptr, &user_optlen, sizeof(user_optlen)) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static long sys_connect_impl(trapframe_t *tf, uint64_t fd, uint64_t addr, uint64_t addrlen,
+                             uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)tf;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+
+    task_t *t = task_current();
+    if (!t || fd >= MAX_FDS || !t->fds[fd].used) {
+        return -1;
+    }
+    fd_t *f = &t->fds[fd];
+    if (f->kind != FD_SOCKET || !f->sock) {
+        return -1;
+    }
+
+    fu_sockaddr_in_t sa;
+    if (copy_sockaddr_in_from_user(&sa, (const void *)addr, addrlen) != 0) {
+        return -1;
+    }
+
+    bool nonblock = (f->flags & O_NONBLOCK) != 0;
+    int rc = net_socket_connect((net_socket_t *)f->sock, swab32(sa.sin_addr), sa.sin_port, nonblock);
+    if (rc == -2) {
+        task_block_on_sleep(timer_ticks() + 1U);
+        return -2;
+    }
+    return rc;
+}
+
+static long sys_listen_impl(trapframe_t *tf, uint64_t fd, uint64_t backlog, uint64_t a2,
+                            uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)tf;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+
+    task_t *t = task_current();
+    if (!t || fd >= MAX_FDS || !t->fds[fd].used) {
+        return -1;
+    }
+    fd_t *f = &t->fds[fd];
+    if (f->kind != FD_SOCKET || !f->sock) {
+        return -1;
+    }
+    return net_socket_listen((net_socket_t *)f->sock, (int)backlog);
+}
+
+static long sys_accept_impl(trapframe_t *tf, uint64_t fd, uint64_t addr, uint64_t addrlen_ptr,
+                            uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)tf;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+
+    task_t *t = task_current();
+    if (!t || fd >= MAX_FDS || !t->fds[fd].used) {
+        return -1;
+    }
+    fd_t *f = &t->fds[fd];
+    if (f->kind != FD_SOCKET || !f->sock) {
+        return -1;
+    }
+
+    bool nonblock = (f->flags & O_NONBLOCK) != 0;
+    net_socket_t *accepted = 0;
+    uint32_t peer_ip_be = 0U;
+    uint16_t peer_port_be = 0U;
+    int rc = net_socket_accept((net_socket_t *)f->sock, &accepted, &peer_ip_be, &peer_port_be, nonblock);
+    if (rc == -2) {
+        task_block_on_sleep(timer_ticks() + 1U);
+        return -2;
+    }
+    if (rc != 0 || !accepted) {
+        return rc;
+    }
+
+    int newfd = task_fd_alloc(t);
+    if (newfd < 0) {
+        net_socket_close(accepted);
+        return -1;
+    }
+    t->fds[newfd].kind = FD_SOCKET;
+    t->fds[newfd].inode = 0;
+    t->fds[newfd].pipe = 0;
+    t->fds[newfd].sock = accepted;
+    t->fds[newfd].offset = 0;
+    t->fds[newfd].flags = O_RDWR;
+
+    if (copy_sockaddr_in_to_user(addr, addrlen_ptr, peer_ip_be, peer_port_be) != 0) {
+        task_fd_close(t, newfd);
+        return -1;
+    }
+    return newfd;
+}
+
+static long sys_getsockname_impl(trapframe_t *tf, uint64_t fd, uint64_t addr, uint64_t addrlen_ptr,
+                                 uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)tf;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+
+    task_t *t = task_current();
+    if (!t || fd >= MAX_FDS || !t->fds[fd].used) {
+        return -1;
+    }
+    fd_t *f = &t->fds[fd];
+    if (f->kind != FD_SOCKET || !f->sock) {
+        return -1;
+    }
+
+    uint32_t addr_be = 0U;
+    uint16_t port_be = 0U;
+    int rc = net_socket_getsockname((net_socket_t *)f->sock, &addr_be, &port_be);
+    if (rc != 0) {
+        return rc;
+    }
+    return copy_sockaddr_in_to_user(addr, addrlen_ptr, addr_be, port_be);
+}
+
+static long sys_getpeername_impl(trapframe_t *tf, uint64_t fd, uint64_t addr, uint64_t addrlen_ptr,
+                                 uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)tf;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+
+    task_t *t = task_current();
+    if (!t || fd >= MAX_FDS || !t->fds[fd].used) {
+        return -1;
+    }
+    fd_t *f = &t->fds[fd];
+    if (f->kind != FD_SOCKET || !f->sock) {
+        return -1;
+    }
+
+    uint32_t addr_be = 0U;
+    uint16_t port_be = 0U;
+    int rc = net_socket_getpeername((net_socket_t *)f->sock, &addr_be, &port_be);
+    if (rc != 0) {
+        return rc;
+    }
+    return copy_sockaddr_in_to_user(addr, addrlen_ptr, addr_be, port_be);
+}
+
+static long sys_shutdown_impl(trapframe_t *tf, uint64_t fd, uint64_t how, uint64_t a2,
+                              uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)tf;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+
+    task_t *t = task_current();
+    if (!t || fd >= MAX_FDS || !t->fds[fd].used) {
+        return -1;
+    }
+    fd_t *f = &t->fds[fd];
+    if (f->kind != FD_SOCKET || !f->sock) {
+        return -1;
+    }
+    return net_socket_shutdown((net_socket_t *)f->sock, (int)how);
 }
 
 static long sys_sleep_impl(trapframe_t *tf, uint64_t ticks, uint64_t a1, uint64_t a2,
@@ -983,6 +1454,13 @@ static int16_t poll_fd_revents(task_t *t, int fd, int16_t events) {
         return revents;
     }
 
+    if (f->kind == FD_SOCKET) {
+        if (!f->sock) {
+            return POLLERR;
+        }
+        return net_socket_poll_revents((net_socket_t *)f->sock, events);
+    }
+
     return POLLNVAL;
 }
 
@@ -1013,6 +1491,8 @@ static long sys_poll_impl(trapframe_t *tf, uint64_t fds_ptr, uint64_t nfds, uint
     if (copy_from_user(kfds, (const void *)fds_ptr, bytes) != 0) {
         return -1;
     }
+
+    net_pump();
 
     int ready = 0;
     for (uint64_t i = 0; i < nfds; i++) {
@@ -1666,6 +2146,12 @@ static long sys_fstat_impl(trapframe_t *tf, uint64_t fd, uint64_t statbuf, uint6
         st.size = 0U;
         st.nlink = 1U;
         st.fs_kind = 0U;
+    } else if (f->kind == FD_SOCKET) {
+        st.type = 0U;
+        st.mode = 0xC000U | 0666U;
+        st.size = 0U;
+        st.nlink = 1U;
+        st.fs_kind = 0U;
     } else {
         st.type = (uint32_t)INODE_DEV;
         st.mode = 0x2000U | 0666U;
@@ -1772,6 +2258,18 @@ typedef struct {
 #define SYSCALL_HANDLER_FOR_SYS_SIGACTION sys_sigaction_impl
 #define SYSCALL_HANDLER_FOR_SYS_SIGPROCMASK sys_sigprocmask_impl
 #define SYSCALL_HANDLER_FOR_SYS_SIGRETURN sys_sigreturn_impl
+#define SYSCALL_HANDLER_FOR_SYS_SOCKET sys_socket_impl
+#define SYSCALL_HANDLER_FOR_SYS_BIND sys_bind_impl
+#define SYSCALL_HANDLER_FOR_SYS_SENDTO sys_sendto_impl
+#define SYSCALL_HANDLER_FOR_SYS_RECVFROM sys_recvfrom_impl
+#define SYSCALL_HANDLER_FOR_SYS_SETSOCKOPT sys_setsockopt_impl
+#define SYSCALL_HANDLER_FOR_SYS_GETSOCKOPT sys_getsockopt_impl
+#define SYSCALL_HANDLER_FOR_SYS_CONNECT sys_connect_impl
+#define SYSCALL_HANDLER_FOR_SYS_LISTEN sys_listen_impl
+#define SYSCALL_HANDLER_FOR_SYS_ACCEPT sys_accept_impl
+#define SYSCALL_HANDLER_FOR_SYS_GETSOCKNAME sys_getsockname_impl
+#define SYSCALL_HANDLER_FOR_SYS_GETPEERNAME sys_getpeername_impl
+#define SYSCALL_HANDLER_FOR_SYS_SHUTDOWN sys_shutdown_impl
 #define SYSCALL_HANDLER_FOR(sym)       SYSCALL_HANDLER_FOR_##sym
 
 enum {
@@ -1846,6 +2344,12 @@ long syscall_dispatch(trapframe_t *tf, bool *force_resched) {
     } else if (nr == SYS_SLEEP && ret == -2) {
         *force_resched = true;
     } else if (nr == SYS_POLL && ret == -2) {
+        *force_resched = true;
+    } else if (nr == SYS_RECVFROM && ret == -2) {
+        *force_resched = true;
+    } else if (nr == SYS_CONNECT && ret == -2) {
+        *force_resched = true;
+    } else if (nr == SYS_ACCEPT && ret == -2) {
         *force_resched = true;
     } else if (nr == SYS_KILL) {
         *force_resched = true;

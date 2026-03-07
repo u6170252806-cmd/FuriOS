@@ -531,6 +531,9 @@ static int parse_dynamic(const Elf64_Ehdr *eh, uint64_t load_bias, uint64_t dyn_
             case DT_TEXTREL:
                 out->textrel = true;
                 break;
+            case DT_SYMBOLIC:
+                out->flags |= DF_SYMBOLIC;
+                break;
             case DT_FLAGS:
                 out->flags = val;
                 if ((val & DF_TEXTREL) != 0U) {
@@ -1108,8 +1111,13 @@ static const char *dso_required_version_name(const dso_t *obj, uint32_t sym_idx,
     return dso_verneed_name_by_index(obj, ver_idx);
 }
 
+static bool dso_prefers_symbolic_lookup(const dso_t *obj) {
+    return obj && (obj->dyn.flags & DF_SYMBOLIC) != 0U;
+}
+
 static int lookup_global_symbol(dso_t *objs, int obj_count, const char *name,
                                 const char *req_version, bool req_hidden,
+                                int start_idx,
                                 uint64_t *addr_out, size_t *size_out,
                                 int *def_obj_idx_out, const Elf64_Sym **def_sym_out) {
     uint64_t weak_addr = 0;
@@ -1118,7 +1126,12 @@ static int lookup_global_symbol(dso_t *objs, int obj_count, const char *name,
     const Elf64_Sym *weak_sym = 0;
     bool have_weak = false;
 
-    for (int i = 0; i < obj_count; i++) {
+    if (start_idx < 0 || start_idx >= obj_count) {
+        start_idx = 0;
+    }
+
+    for (int pass = 0; pass < obj_count; pass++) {
+        int i = (start_idx + pass) % obj_count;
         dso_t *obj = &objs[i];
         if (!obj->dyn.symtab || !obj->dyn.strtab || obj->dyn.sym_count == 0U) {
             continue;
@@ -1245,7 +1258,9 @@ static int resolve_symbol_for_reloc(dso_t *objs, int obj_count, int obj_idx,
 
     bool req_hidden = false;
     const char *req_version = dso_required_version_name(obj, sym_idx, &req_hidden);
+    int start_idx = dso_prefers_symbolic_lookup(obj) ? obj_idx : 0;
     if (lookup_global_symbol(objs, obj_count, name, req_version, req_hidden,
+                             start_idx,
                              addr_out, size_out, def_obj_idx_out, def_sym_out) != 0) {
         return -1;
     }

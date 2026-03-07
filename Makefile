@@ -18,7 +18,7 @@ ASFLAGS := -mcpu=cortex-a53
 LDFLAGS_KERNEL := -nostdlib -static -Wl,--build-id=none -Wl,-T,linker.ld
 LDFLAGS_USER := -nostdlib -static -Wl,--build-id=none -Wl,-T,user/user.ld
 
-USER_PROGS := init sh ls cat echo clear nano elfinfo mkdir rmdir rm pwd touch cp mv sleep kill mount umount ln chmod mkfs.ext4 fsck.ext4 tcc ar ranlib as
+USER_PROGS := init sh ls cat echo clear nano elfinfo mkdir rmdir rm pwd touch cp mv sleep kill ping ifconfig route arp nc nslookup dhcp mount umount ln chmod mkfs.ext4 fsck.ext4 tcc ar ranlib as
 USER_ELFS := $(addprefix $(UBUILD)/,$(addsuffix .elf,$(USER_PROGS)))
 EMBED_OBJS := $(addprefix $(EMBED)/,$(addsuffix .o,$(USER_PROGS)))
 DYN_LOADER_ELF := $(UBUILD)/ld-furios.elf
@@ -56,6 +56,10 @@ KERNEL_OBJS := \
 	$(KBUILD)/virtio_blk.o \
 	$(KBUILD)/ahci.o \
 	$(KBUILD)/nvme.o \
+	$(KBUILD)/rtl8139.o \
+	$(KBUILD)/rtl8125.o \
+	$(KBUILD)/netdev.o \
+	$(KBUILD)/net.o \
 	$(KBUILD)/block_cache.o \
 	$(KBUILD)/fs.o \
 	$(KBUILD)/pipe.o \
@@ -75,7 +79,8 @@ USER_LIB_OBJS := \
 	$(UBUILD)/io.o \
 	$(UBUILD)/alloc.o \
 	$(UBUILD)/posix.o \
-	$(UBUILD)/stdio.o
+	$(UBUILD)/stdio.o \
+	$(UBUILD)/netdb.o
 
 all: $(BUILD)/kernel.elf
 
@@ -124,7 +129,7 @@ $(TCCRT)/crtbegin.o: user/tccrt/crtbegin.S | $(TCCRT)
 $(TCCRT)/crtend.o: user/tccrt/crtend.S | $(TCCRT)
 	$(CC) $(ASFLAGS) -c -o $@ $<
 
-$(TCCRT)/libc.a: $(UBUILD)/syscall.o $(UBUILD)/string.o $(UBUILD)/io.o $(UBUILD)/alloc.o $(UBUILD)/posix.o $(UBUILD)/stdio.o | $(TCCRT)
+$(TCCRT)/libc.a: $(UBUILD)/syscall.o $(UBUILD)/string.o $(UBUILD)/io.o $(UBUILD)/alloc.o $(UBUILD)/posix.o $(UBUILD)/stdio.o $(UBUILD)/netdb.o | $(TCCRT)
 	$(AR) rcs $@ $^
 
 $(TCCRT)/libtcc1.a: | $(TCCRT)

@@ -12,8 +12,9 @@
 #include "task.h"
 #include "print.h"
 #include "timer.h"
+#include "net.h"
 
-#define INODE_POOL_MAX 128
+#define INODE_POOL_MAX 512
 #define MOUNT_TABLE_MAX 4
 #define DEV_PARTS_PER_DISK_MAX 16
 
@@ -58,6 +59,20 @@ extern uint8_t _binary_build_user_sleep_elf_start[];
 extern uint8_t _binary_build_user_sleep_elf_end[];
 extern uint8_t _binary_build_user_kill_elf_start[];
 extern uint8_t _binary_build_user_kill_elf_end[];
+extern uint8_t _binary_build_user_ping_elf_start[];
+extern uint8_t _binary_build_user_ping_elf_end[];
+extern uint8_t _binary_build_user_ifconfig_elf_start[];
+extern uint8_t _binary_build_user_ifconfig_elf_end[];
+extern uint8_t _binary_build_user_route_elf_start[];
+extern uint8_t _binary_build_user_route_elf_end[];
+extern uint8_t _binary_build_user_arp_elf_start[];
+extern uint8_t _binary_build_user_arp_elf_end[];
+extern uint8_t _binary_build_user_nc_elf_start[];
+extern uint8_t _binary_build_user_nc_elf_end[];
+extern uint8_t _binary_build_user_nslookup_elf_start[];
+extern uint8_t _binary_build_user_nslookup_elf_end[];
+extern uint8_t _binary_build_user_dhcp_elf_start[];
+extern uint8_t _binary_build_user_dhcp_elf_end[];
 extern uint8_t _binary_build_user_mount_elf_start[];
 extern uint8_t _binary_build_user_mount_elf_end[];
 extern uint8_t _binary_build_user_umount_elf_start[];
@@ -139,6 +154,23 @@ static const char sdk_furios_h[] =
     "#define POLLERR 0x0008\n"
     "#define POLLHUP 0x0010\n"
     "#define POLLNVAL 0x0020\n"
+    "#define AF_INET 2\n"
+    "#define SOCK_STREAM 1\n"
+    "#define SOCK_DGRAM 2\n"
+    "#define SOCK_NONBLOCK 0x800\n"
+    "#define SOL_SOCKET 1\n"
+    "#define SO_REUSEADDR 2\n"
+    "#define SO_ERROR 4\n"
+    "#define SO_BROADCAST 6\n"
+    "#define IPPROTO_IP 0\n"
+    "#define IPPROTO_ICMP 1\n"
+    "#define IPPROTO_TCP 6\n"
+    "#define IPPROTO_UDP 17\n"
+    "#define MSG_DONTWAIT 0x40\n"
+    "#define SHUT_RD 0\n"
+    "#define SHUT_WR 1\n"
+    "#define SHUT_RDWR 2\n"
+    "#define SOMAXCONN 8\n"
     "#define WNOHANG 0x1\n"
     "#define WUNTRACED 0x2\n"
     "#define WCONTINUED 0x8\n"
@@ -146,6 +178,7 @@ static const char sdk_furios_h[] =
     "#define SIGINT 2\n"
     "#define SIGQUIT 3\n"
     "#define SIGKILL 9\n"
+    "#define SIGPIPE 13\n"
     "#define SIGTERM 15\n"
     "#define SIGCHLD 17\n"
     "#define SIGCONT 18\n"
@@ -179,6 +212,23 @@ static const char sdk_furios_h[] =
     "    uint64_t sa_restorer;\n"
     "    uint64_t sa_mask;\n"
     "} fu_sigaction_t;\n"
+    "typedef struct {\n"
+    "    uint16_t sa_family;\n"
+    "    char sa_data[14];\n"
+    "} fu_sockaddr_t;\n"
+    "typedef struct {\n"
+    "    uint16_t sin_family;\n"
+    "    uint16_t sin_port;\n"
+    "    uint32_t sin_addr;\n"
+    "    uint8_t sin_zero[8];\n"
+    "} fu_sockaddr_in_t;\n"
+    "typedef struct hostent {\n"
+    "    char *h_name;\n"
+    "    char **h_aliases;\n"
+    "    int h_addrtype;\n"
+    "    int h_length;\n"
+    "    char **h_addr_list;\n"
+    "} hostent;\n"
     "typedef struct { char name[32]; uint32_t type; } dirent_t;\n"
     "long sys_write(int fd, const void *buf, unsigned long len);\n"
     "long sys_read(int fd, void *buf, unsigned long len);\n"
@@ -196,6 +246,20 @@ static const char sdk_furios_h[] =
     "int sys_sigreturn(void);\n"
     "int sys_fcntl(int fd, int cmd, int arg);\n"
     "int sys_poll(fu_pollfd_t *fds, int nfds, unsigned long timeout_ticks);\n"
+    "int sys_socket(int domain, int type, int protocol);\n"
+    "int sys_bind(int fd, const fu_sockaddr_t *addr, unsigned long addrlen);\n"
+    "long sys_sendto(int fd, const void *buf, unsigned long len, int flags,\n"
+    "               const fu_sockaddr_t *dest_addr, unsigned long addrlen);\n"
+    "long sys_recvfrom(int fd, void *buf, unsigned long len, int flags,\n"
+    "                 fu_sockaddr_t *src_addr, unsigned long *addrlen);\n"
+    "int sys_setsockopt(int fd, int level, int optname, const void *optval, unsigned long optlen);\n"
+    "int sys_getsockopt(int fd, int level, int optname, void *optval, unsigned long *optlen);\n"
+    "int sys_connect(int fd, const fu_sockaddr_t *addr, unsigned long addrlen);\n"
+    "int sys_listen(int fd, int backlog);\n"
+    "int sys_accept(int fd, fu_sockaddr_t *addr, unsigned long *addrlen);\n"
+    "int sys_getsockname(int fd, fu_sockaddr_t *addr, unsigned long *addrlen);\n"
+    "int sys_getpeername(int fd, fu_sockaddr_t *addr, unsigned long *addrlen);\n"
+    "int sys_shutdown(int fd, int how);\n"
     "int sys_setpgid(int pid, int pgid);\n"
     "int sys_getpgid(int pid);\n"
     "int sys_chdir(const char *path);\n"
@@ -228,6 +292,11 @@ static const char sdk_furios_h[] =
     "void *sys_brk(void *addr);\n"
     "void *sys_sbrk(long increment);\n"
     "void sys_yield(void);\n"
+    "int fu_parse_ipv4(const char *src, uint32_t *out_be);\n"
+    "void fu_format_ipv4(uint32_t ip_be, char *buf, unsigned long size);\n"
+    "int fu_resolver_nameserver(uint32_t *ip_be, uint16_t *port);\n"
+    "int fu_resolve_name_ipv4(const char *name, uint32_t *out_be);\n"
+    "int fu_resolve_name_ipv4_at(const char *name, uint32_t server_ip_be, uint16_t server_port, uint32_t *out_be);\n"
     "size_t strlen(const char *s);\n"
     "int strcmp(const char *a, const char *b);\n"
     "int strncmp(const char *a, const char *b, size_t n);\n"
@@ -258,39 +327,39 @@ static const char sdk_unistd_h[] =
     "#ifndef FUROS_SDK_UNISTD_H\n"
     "#define FUROS_SDK_UNISTD_H\n"
     "#include <furios.h>\n"
-    "static inline long read(int fd, void *buf, unsigned long len) { return sys_read(fd, buf, len); }\n"
-    "static inline long write(int fd, const void *buf, unsigned long len) { return sys_write(fd, buf, len); }\n"
-    "static inline int close(int fd) { return sys_close(fd); }\n"
-    "static inline int fsync(int fd) { return sys_fsync(fd); }\n"
-    "static inline int fork(void) { return sys_fork(); }\n"
-    "static inline int execv(const char *p, const char *const a[]) { return sys_exec(p, a); }\n"
-    "static inline int execve(const char *p, const char *const a[], const char *const e[]) { (void)e; return sys_exec(p, a); }\n"
-    "static inline int chdir(const char *p) { return sys_chdir(p); }\n"
-    "static inline int unlink(const char *p) { return sys_unlink(p); }\n"
-    "static inline int link(const char *o, const char *n) { return sys_link(o, n); }\n"
-    "static inline int symlink(const char *t, const char *l) { return sys_symlink(t, l); }\n"
-    "static inline int readlink(const char *p, char *b, unsigned long n) { return sys_readlink(p, b, n); }\n"
-    "static inline int mkdir(const char *p) { return sys_mkdir(p); }\n"
-    "static inline int rmdir(const char *p) { return sys_rmdir(p); }\n"
-    "static inline int getpid(void) { return sys_getpid(); }\n"
-    "static inline int pipe(int fds[2]) { return sys_pipe(fds); }\n"
-    "static inline int dup2(int oldfd, int newfd) { return sys_dup2(oldfd, newfd); }\n"
-    "static inline int sleep(unsigned long ticks) { return sys_sleep(ticks); }\n"
-    "static inline int getcwd(char *buf, unsigned long len) { return sys_getcwd(buf, len); }\n"
-    "static inline int rename(const char *a, const char *b) { return sys_rename(a, b); }\n"
-    "static inline long lseek(int fd, long off, int whence) { return sys_lseek(fd, off, whence); }\n"
-    "static inline int chmod(const char *p, uint32_t mode) { return sys_chmod(p, mode); }\n"
-    "static inline void *brk(void *addr) { return sys_brk(addr); }\n"
-    "static inline void *sbrk(long inc) { return sys_sbrk(inc); }\n"
-    "static inline void _exit(int code) { sys_exit(code); }\n"
+    "long read(int fd, void *buf, unsigned long len);\n"
+    "long write(int fd, const void *buf, unsigned long len);\n"
+    "int close(int fd);\n"
+    "int fsync(int fd);\n"
+    "int fork(void);\n"
+    "int execv(const char *p, const char *const a[]);\n"
+    "int execve(const char *p, const char *const a[], const char *const e[]);\n"
+    "int chdir(const char *p);\n"
+    "int unlink(const char *p);\n"
+    "int link(const char *o, const char *n);\n"
+    "int symlink(const char *t, const char *l);\n"
+    "int readlink(const char *p, char *b, unsigned long n);\n"
+    "int mkdir(const char *p);\n"
+    "int rmdir(const char *p);\n"
+    "int getpid(void);\n"
+    "int pipe(int fds[2]);\n"
+    "int dup2(int oldfd, int newfd);\n"
+    "int sleep(unsigned long ticks);\n"
+    "char *getcwd(char *buf, unsigned long len);\n"
+    "int rename(const char *a, const char *b);\n"
+    "long lseek(int fd, long off, int whence);\n"
+    "int chmod(const char *p, uint32_t mode);\n"
+    "int brk(void *addr);\n"
+    "void *sbrk(long inc);\n"
+    "void _exit(int code) __attribute__((noreturn));\n"
     "#endif\n";
 
 static const char sdk_fcntl_h[] =
     "#ifndef FUROS_SDK_FCNTL_H\n"
     "#define FUROS_SDK_FCNTL_H\n"
     "#include <furios.h>\n"
-    "static inline int open(const char *path, int flags) { return sys_open(path, flags); }\n"
-    "static inline int fcntl(int fd, int cmd, int arg) { return sys_fcntl(fd, cmd, arg); }\n"
+    "int open(const char *path, int flags);\n"
+    "int fcntl(int fd, int cmd, int arg);\n"
     "#endif\n";
 
 static const char sdk_string_h[] =
@@ -356,9 +425,9 @@ static const char sdk_sys_stat_h[] =
     "#define S_IROTH 0004\n"
     "#define S_IWOTH 0002\n"
     "#define S_IXOTH 0001\n"
-    "static inline int stat(const char *path, stat_t *st) { return sys_stat(path, st); }\n"
-    "static inline int lstat(const char *path, stat_t *st) { return sys_lstat(path, st); }\n"
-    "static inline int fstat(int fd, stat_t *st) { return sys_fstat(fd, st); }\n"
+    "int stat(const char *path, stat_t *st);\n"
+    "int lstat(const char *path, stat_t *st);\n"
+    "int fstat(int fd, stat_t *st);\n"
     "#endif\n";
 
 static const char sdk_stddef_h[] =
@@ -436,6 +505,16 @@ static const char sdk_errno_h[] =
     "#define ENOTTY 25\n"
     "#define ENOSPC 28\n"
     "#define EPIPE 32\n"
+    "#define EOPNOTSUPP 95\n"
+    "#define ENETUNREACH 101\n"
+    "#define ECONNRESET 104\n"
+    "#define ENOBUFS 105\n"
+    "#define EISCONN 106\n"
+    "#define ENOTCONN 107\n"
+    "#define ETIMEDOUT 110\n"
+    "#define ECONNREFUSED 111\n"
+    "#define EALREADY 114\n"
+    "#define EINPROGRESS 115\n"
     "#define ENOSYS 38\n"
     "#endif\n";
 
@@ -460,14 +539,15 @@ static const char sdk_sys_wait_h[] =
     "#define WIFSTOPPED(status) (((status) & 0xff) == 0x7f)\n"
     "#define WSTOPSIG(status) (((status) >> 8) & 0xff)\n"
     "#define WIFCONTINUED(status) ((status) == 0xffff)\n"
-    "static inline int waitpid(int pid, int *status, int options) { return sys_waitpid(pid, status, options); }\n"
-    "static inline int wait(int *status) { return sys_wait(-1, status); }\n"
+    "int waitpid(int pid, int *status, int options);\n"
+    "int wait(int *status);\n"
     "#endif\n";
 
 static const char sdk_signal_h[] =
     "#ifndef _SIGNAL_H\n"
     "#define _SIGNAL_H\n"
     "#include <furios.h>\n"
+    "extern void __sigreturn_trampoline(void);\n"
     "typedef struct sigaction {\n"
     "    unsigned long sa_handler;\n"
     "    unsigned long sa_flags;\n"
@@ -485,13 +565,9 @@ static const char sdk_signal_h[] =
     "#define SA_RESETHAND 0x80000000UL\n"
     "#define SA_NOCLDSTOP 0x00000001UL\n"
     "#define SA_NOCLDWAIT 0x00000002UL\n"
-    "static inline int kill(int pid, int sig) { return sys_kill(pid, sig); }\n"
-    "static inline int sigaction(int sig, const sigaction_t *act, sigaction_t *oldact) {\n"
-    "    return sys_sigaction(sig, (const fu_sigaction_t *)act, (fu_sigaction_t *)oldact);\n"
-    "}\n"
-    "static inline int sigprocmask(int how, unsigned long set, unsigned long *oldset) {\n"
-    "    return sys_sigprocmask(how, set, oldset);\n"
-    "}\n"
+    "int kill(int pid, int sig);\n"
+    "int sigaction(int sig, const sigaction_t *act, sigaction_t *oldact);\n"
+    "int sigprocmask(int how, unsigned long set, unsigned long *oldset);\n"
     "#endif\n";
 
 static const char sdk_poll_h[] =
@@ -499,23 +575,78 @@ static const char sdk_poll_h[] =
     "#define _POLL_H\n"
     "#include <furios.h>\n"
     "typedef fu_pollfd_t pollfd;\n"
-    "static inline int poll(pollfd *fds, int nfds, unsigned long timeout_ticks) {\n"
-    "    return sys_poll((fu_pollfd_t *)fds, nfds, timeout_ticks);\n"
+    "int poll(pollfd *fds, int nfds, unsigned long timeout_ticks);\n"
+    "#endif\n";
+
+static const char sdk_sys_socket_h[] =
+    "#ifndef _SYS_SOCKET_H\n"
+    "#define _SYS_SOCKET_H\n"
+    "#include <furios.h>\n"
+    "typedef fu_sockaddr_t sockaddr;\n"
+    "typedef fu_sockaddr_in_t sockaddr_in;\n"
+    "int socket(int domain, int type, int protocol);\n"
+    "int bind(int fd, const sockaddr *addr, unsigned long addrlen);\n"
+    "long sendto(int fd, const void *buf, unsigned long len, int flags,\n"
+    "            const sockaddr *dest_addr, unsigned long addrlen);\n"
+    "long recvfrom(int fd, void *buf, unsigned long len, int flags,\n"
+    "              sockaddr *src_addr, unsigned long *addrlen);\n"
+    "int setsockopt(int fd, int level, int optname,\n"
+    "               const void *optval, unsigned long optlen);\n"
+    "int getsockopt(int fd, int level, int optname,\n"
+    "               void *optval, unsigned long *optlen);\n"
+    "int connect(int fd, const sockaddr *addr, unsigned long addrlen);\n"
+    "int listen(int fd, int backlog);\n"
+    "int accept(int fd, sockaddr *addr, unsigned long *addrlen);\n"
+    "int getsockname(int fd, sockaddr *addr, unsigned long *addrlen);\n"
+    "int getpeername(int fd, sockaddr *addr, unsigned long *addrlen);\n"
+    "int shutdown(int fd, int how);\n"
+    "#endif\n";
+
+static const char sdk_netinet_in_h[] =
+    "#ifndef _NETINET_IN_H\n"
+    "#define _NETINET_IN_H\n"
+    "#include <furios.h>\n"
+    "typedef struct { uint32_t s_addr; } in_addr;\n"
+    "typedef fu_sockaddr_in_t sockaddr_in;\n"
+    "#define INADDR_ANY 0U\n"
+    "#define INADDR_LOOPBACK 0x7F000001U\n"
+    "#define INADDR_BROADCAST 0xFFFFFFFFU\n"
+    "static inline uint16_t htons(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); }\n"
+    "static inline uint16_t ntohs(uint16_t v) { return htons(v); }\n"
+    "static inline uint32_t htonl(uint32_t v) {\n"
+    "    return ((v & 0x000000FFU) << 24) | ((v & 0x0000FF00U) << 8) |\n"
+    "           ((v & 0x00FF0000U) >> 8) | ((v & 0xFF000000U) >> 24);\n"
     "}\n"
+    "static inline uint32_t ntohl(uint32_t v) { return htonl(v); }\n"
+    "#endif\n";
+
+static const char sdk_arpa_inet_h[] =
+    "#ifndef _ARPA_INET_H\n"
+    "#define _ARPA_INET_H\n"
+    "#include <netinet/in.h>\n"
+    "int inet_aton(const char *src, in_addr *out);\n"
+    "unsigned long inet_addr(const char *src);\n"
+    "char *inet_ntoa(in_addr in);\n"
+    "int inet_pton(int af, const char *src, void *dst);\n"
+    "const char *inet_ntop(int af, const void *src, char *dst, unsigned long size);\n"
+    "#endif\n";
+
+static const char sdk_netdb_h[] =
+    "#ifndef _NETDB_H\n"
+    "#define _NETDB_H\n"
+    "#include <furios.h>\n"
+    "#define h_addr h_addr_list[0]\n"
+    "hostent *gethostbyname(const char *name);\n"
     "#endif\n";
 
 static const char sdk_sys_mman_h[] =
     "#ifndef _SYS_MMAN_H\n"
     "#define _SYS_MMAN_H\n"
     "#include <furios.h>\n"
-    "static inline void *mmap(void *addr, unsigned long len, int prot, int flags, int fd, unsigned long offset) {\n"
-    "    return sys_mmap(addr, len, prot, flags, fd, offset);\n"
-    "}\n"
-    "static inline int munmap(void *addr, unsigned long len) { return sys_munmap(addr, len); }\n"
-    "static inline int mprotect(void *addr, unsigned long len, int prot) { return sys_mprotect(addr, len, prot); }\n"
-    "static inline int msync(void *addr, unsigned long len, unsigned long flags) {\n"
-    "    return sys_msync(addr, len, flags);\n"
-    "}\n"
+    "void *mmap(void *addr, unsigned long len, int prot, int flags, int fd, unsigned long offset);\n"
+    "int munmap(void *addr, unsigned long len);\n"
+    "int mprotect(void *addr, unsigned long len, int prot);\n"
+    "int msync(void *addr, unsigned long len, unsigned long flags);\n"
     "#endif\n";
 
 static const char sdk_limits_h[] =
@@ -613,6 +744,7 @@ static inode_t *inode_alloc(const char *name, inode_type_t type) {
             ino->name[INODE_NAME_MAX] = '\0';
             ino->type = type;
             ino->fs_kind = FS_KIND_MEM;
+            ino->fs_id = 0U;
             ino->fs_ino = 0;
             return ino;
         }
@@ -1309,6 +1441,7 @@ void fs_init(void) {
     (void)mk_dir(root_inode, "mnt");
     inode_t *usr_include = usr ? mk_dir(usr, "include") : 0;
     inode_t *usr_include_sys = usr_include ? mk_dir(usr_include, "sys") : 0;
+    inode_t *usr_include_arpa = usr_include ? mk_dir(usr_include, "arpa") : 0;
     inode_t *usr_lib = usr ? mk_dir(usr, "lib") : 0;
 
     mk_file(bin, "init", _binary_build_user_init_elf_start,
@@ -1361,6 +1494,27 @@ void fs_init(void) {
             true, false);
     mk_file(bin, "kill", _binary_build_user_kill_elf_start,
             blob_size(_binary_build_user_kill_elf_start, _binary_build_user_kill_elf_end),
+            true, false);
+    mk_file(bin, "ping", _binary_build_user_ping_elf_start,
+            blob_size(_binary_build_user_ping_elf_start, _binary_build_user_ping_elf_end),
+            true, false);
+    mk_file(bin, "ifconfig", _binary_build_user_ifconfig_elf_start,
+            blob_size(_binary_build_user_ifconfig_elf_start, _binary_build_user_ifconfig_elf_end),
+            true, false);
+    mk_file(bin, "route", _binary_build_user_route_elf_start,
+            blob_size(_binary_build_user_route_elf_start, _binary_build_user_route_elf_end),
+            true, false);
+    mk_file(bin, "arp", _binary_build_user_arp_elf_start,
+            blob_size(_binary_build_user_arp_elf_start, _binary_build_user_arp_elf_end),
+            true, false);
+    mk_file(bin, "nc", _binary_build_user_nc_elf_start,
+            blob_size(_binary_build_user_nc_elf_start, _binary_build_user_nc_elf_end),
+            true, false);
+    mk_file(bin, "nslookup", _binary_build_user_nslookup_elf_start,
+            blob_size(_binary_build_user_nslookup_elf_start, _binary_build_user_nslookup_elf_end),
+            true, false);
+    mk_file(bin, "dhcp", _binary_build_user_dhcp_elf_start,
+            blob_size(_binary_build_user_dhcp_elf_start, _binary_build_user_dhcp_elf_end),
             true, false);
     mk_file(bin, "mount", _binary_build_user_mount_elf_start,
             blob_size(_binary_build_user_mount_elf_start, _binary_build_user_mount_elf_end),
@@ -1465,12 +1619,24 @@ void fs_init(void) {
         (void)mk_text_file(usr_include, "string.h", sdk_string_h, false);
         (void)mk_text_file(usr_include, "stdio.h", sdk_stdio_h, false);
         (void)mk_text_file(usr_include, "stdlib.h", sdk_stdlib_h, false);
+        (void)mk_text_file(usr_include, "netdb.h", sdk_netdb_h, false);
     }
     if (usr_include_sys) {
         (void)mk_text_file(usr_include_sys, "stat.h", sdk_sys_stat_h, false);
         (void)mk_text_file(usr_include_sys, "types.h", sdk_sys_types_h, false);
         (void)mk_text_file(usr_include_sys, "wait.h", sdk_sys_wait_h, false);
         (void)mk_text_file(usr_include_sys, "mman.h", sdk_sys_mman_h, false);
+        (void)mk_text_file(usr_include_sys, "socket.h", sdk_sys_socket_h, false);
+    }
+    inode_t *usr_include_netinet = 0;
+    if (usr_include) {
+        usr_include_netinet = mk_dir(usr_include, "netinet");
+    }
+    if (usr_include_netinet) {
+        (void)mk_text_file(usr_include_netinet, "in.h", sdk_netinet_in_h, false);
+    }
+    if (usr_include_arpa) {
+        (void)mk_text_file(usr_include_arpa, "inet.h", sdk_arpa_inet_h, false);
     }
     if (compat_include) {
         (void)mk_text_file(compat_include, "stddef.h", sdk_stddef_h, false);
@@ -1494,12 +1660,22 @@ void fs_init(void) {
         (void)mk_text_file(compat_include, "string.h", sdk_string_h, false);
         (void)mk_text_file(compat_include, "stdio.h", sdk_stdio_h, false);
         (void)mk_text_file(compat_include, "stdlib.h", sdk_stdlib_h, false);
+        (void)mk_text_file(compat_include, "netdb.h", sdk_netdb_h, false);
         inode_t *compat_sys = mk_dir(compat_include, "sys");
         if (compat_sys) {
             (void)mk_text_file(compat_sys, "stat.h", sdk_sys_stat_h, false);
             (void)mk_text_file(compat_sys, "types.h", sdk_sys_types_h, false);
             (void)mk_text_file(compat_sys, "wait.h", sdk_sys_wait_h, false);
             (void)mk_text_file(compat_sys, "mman.h", sdk_sys_mman_h, false);
+            (void)mk_text_file(compat_sys, "socket.h", sdk_sys_socket_h, false);
+        }
+        inode_t *compat_netinet = mk_dir(compat_include, "netinet");
+        if (compat_netinet) {
+            (void)mk_text_file(compat_netinet, "in.h", sdk_netinet_in_h, false);
+        }
+        inode_t *compat_arpa = mk_dir(compat_include, "arpa");
+        if (compat_arpa) {
+            (void)mk_text_file(compat_arpa, "inet.h", sdk_arpa_inet_h, false);
         }
     }
 
@@ -1509,6 +1685,12 @@ void fs_init(void) {
         memcpy(motd->data, msg, strlen(msg));
         motd->size = strlen(msg);
     }
+    (void)mk_text_file(etc, "resolv.conf", "nameserver 10.0.2.3\n", true);
+    (void)mk_text_file(etc, "hosts",
+                       "127.0.0.1 localhost\n"
+                       "10.0.2.2 host.qemu gateway.qemu\n"
+                       "10.0.2.3 dns.qemu\n",
+                       true);
 
     if (dev) {
         dev_root_inode = dev;
@@ -1516,6 +1698,9 @@ void fs_init(void) {
         (void)mk_dev(dev, "null", DEV_NULL, true);
         (void)mk_dev(dev, "zero", DEV_ZERO, true);
         (void)mk_dev(dev, "tty", DEV_TTY, true);
+        if (net_ready()) {
+            (void)mk_dev(dev, "net0", DEV_NET0, true);
+        }
         if (dev_block_ready_kind(DEV_VDA)) {
             n = mk_dev(dev, "vda", DEV_VDA, true);
             if (n) {
@@ -4259,6 +4444,13 @@ int fs_read(inode_t *inode, size_t *offset, void *buf, size_t len) {
                 *offset += done;
                 return (int)done;
             }
+            case DEV_NET0: {
+                int n = net_dev_read(buf, len);
+                if (n > 0) {
+                    *offset += (size_t)n;
+                }
+                return n;
+            }
             default:
                 if (fs_is_block_dev(inode)) {
                     return pagecache_read(inode, offset, buf, len);
@@ -4314,6 +4506,13 @@ int fs_write(inode_t *inode, size_t *offset, const void *buf, size_t len) {
                 *offset += len;
                 return (int)len;
             }
+            case DEV_NET0: {
+                int n = net_dev_write(buf, len);
+                if (n > 0) {
+                    *offset += (size_t)n;
+                }
+                return n;
+            }
             default:
                 if (fs_is_block_dev(inode)) {
                     return pagecache_write(inode, offset, buf, len);
@@ -4352,7 +4551,7 @@ int fs_truncate(inode_t *inode, size_t size) {
             return rc != 0 ? rc : fs_ext4_tx_error();
         }
         if (rc == 0) {
-            pagecache_invalidate_inode(inode);
+            pagecache_truncate_inode(inode, size);
         }
         return rc;
     }
@@ -4369,7 +4568,7 @@ int fs_truncate(inode_t *inode, size_t size) {
         memset(inode->data + inode->size, 0, size - inode->size);
     }
     inode->size = size;
-    pagecache_invalidate_inode(inode);
+    pagecache_truncate_inode(inode, size);
     return 0;
 }
 

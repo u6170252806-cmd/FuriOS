@@ -10,6 +10,7 @@ void puts(const char *s) {
 
 int readline(char *buf, int maxlen) {
     int n = 0;
+    int overflow = 0;
     while (n < maxlen - 1) {
         char c = 0;
         long r = sys_read(0, &c, 1);
@@ -33,7 +34,27 @@ int readline(char *buf, int maxlen) {
         buf[n++] = c;
         putc(c);
     }
+    if (n == maxlen - 1) {
+        for (;;) {
+            char c = 0;
+            long r = sys_read(0, &c, 1);
+            if (r <= 0) {
+                break;
+            }
+            if (c == '\r') {
+                c = '\n';
+            }
+            if (c == '\n') {
+                putc('\n');
+                break;
+            }
+            overflow = 1;
+        }
+    }
     buf[n] = '\0';
+    if (overflow && n > 0 && maxlen >= 2) {
+        buf[maxlen - 2] = '\0';
+    }
     return n;
 }
 

@@ -106,6 +106,72 @@ int sys_poll(fu_pollfd_t *fds, int nfds, unsigned long timeout_ticks) {
     }
 }
 
+int sys_socket(int domain, int type, int protocol) {
+    return (int)syscall6(SYS_SOCKET, (long)domain, (long)type, (long)protocol, 0, 0, 0);
+}
+
+int sys_bind(int fd, const fu_sockaddr_t *addr, unsigned long addrlen) {
+    return (int)syscall6(SYS_BIND, (long)fd, (long)addr, (long)addrlen, 0, 0, 0);
+}
+
+long sys_sendto(int fd, const void *buf, unsigned long len, int flags,
+                const fu_sockaddr_t *dest_addr, unsigned long addrlen) {
+    return syscall6(SYS_SENDTO, (long)fd, (long)buf, (long)len, (long)flags,
+                    (long)dest_addr, (long)addrlen);
+}
+
+long sys_recvfrom(int fd, void *buf, unsigned long len, int flags,
+                  fu_sockaddr_t *src_addr, unsigned long *addrlen) {
+    long rc;
+    do {
+        rc = syscall6(SYS_RECVFROM, (long)fd, (long)buf, (long)len, (long)flags,
+                      (long)src_addr, (long)addrlen);
+    } while (rc == -2);
+    return rc;
+}
+
+int sys_setsockopt(int fd, int level, int optname, const void *optval, unsigned long optlen) {
+    return (int)syscall6(SYS_SETSOCKOPT, (long)fd, (long)level, (long)optname,
+                         (long)optval, (long)optlen, 0);
+}
+
+int sys_getsockopt(int fd, int level, int optname, void *optval, unsigned long *optlen) {
+    return (int)syscall6(SYS_GETSOCKOPT, (long)fd, (long)level, (long)optname,
+                         (long)optval, (long)optlen, 0);
+}
+
+int sys_connect(int fd, const fu_sockaddr_t *addr, unsigned long addrlen) {
+    long rc;
+    do {
+        rc = syscall6(SYS_CONNECT, (long)fd, (long)addr, (long)addrlen, 0, 0, 0);
+    } while (rc == -2);
+    return (int)rc;
+}
+
+int sys_listen(int fd, int backlog) {
+    return (int)syscall6(SYS_LISTEN, (long)fd, (long)backlog, 0, 0, 0, 0);
+}
+
+int sys_accept(int fd, fu_sockaddr_t *addr, unsigned long *addrlen) {
+    long rc;
+    do {
+        rc = syscall6(SYS_ACCEPT, (long)fd, (long)addr, (long)addrlen, 0, 0, 0);
+    } while (rc == -2);
+    return (int)rc;
+}
+
+int sys_getsockname(int fd, fu_sockaddr_t *addr, unsigned long *addrlen) {
+    return (int)syscall6(SYS_GETSOCKNAME, (long)fd, (long)addr, (long)addrlen, 0, 0, 0);
+}
+
+int sys_getpeername(int fd, fu_sockaddr_t *addr, unsigned long *addrlen) {
+    return (int)syscall6(SYS_GETPEERNAME, (long)fd, (long)addr, (long)addrlen, 0, 0, 0);
+}
+
+int sys_shutdown(int fd, int how) {
+    return (int)syscall6(SYS_SHUTDOWN, (long)fd, (long)how, 0, 0, 0, 0);
+}
+
 int sys_setpgid(int pid, int pgid) {
     return (int)syscall6(SYS_SETPGID, pid, pgid, 0, 0, 0, 0);
 }

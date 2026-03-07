@@ -1,9 +1,10 @@
 #include "user.h"
 
-#define SH_MAX_TOKENS 48
+#define SH_MAX_TOKENS 64
 #define SH_MAX_CMDS 8
 #define SH_MAX_ARGS 16
-#define SH_MAX_WORDS 256
+#define SH_MAX_WORDS 2048
+#define SH_MAX_LINE  512
 
 typedef struct {
     char *argv[SH_MAX_ARGS];
@@ -374,7 +375,7 @@ int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
 
-    char line[128];
+    char line[SH_MAX_LINE];
     char words[SH_MAX_WORDS];
     shell_cmd_t cmds[SH_MAX_CMDS];
 

@@ -37,6 +37,8 @@ typedef struct {
     int dirty;
     int quit_guard;
     int paste_mode;
+    unsigned char pending_keys[256];
+    int pending_len;
     char filename[256];
     char status[128];
     int status_ttl;
@@ -86,6 +88,133 @@ static int read_byte_timeout(char *out, unsigned long timeout_ticks) {
     return 0;
 }
 
+static int read_burst(char *buf, int cap, unsigned long first_timeout_ticks,
+                      unsigned long next_timeout_ticks) {
+    if (!buf || cap <= 0) {
+        return 0;
+    }
+
+    int n = 0;
+    if (read_byte_timeout(&buf[n], first_timeout_ticks) != 0) {
+        return 0;
+    }
+    n++;
+
+    while (n < cap) {
+        fu_pollfd_t pfd;
+        pfd.fd = 0;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int ready = sys_poll(&pfd, 1, next_timeout_ticks);
+        if (ready <= 0 || (pfd.revents & (POLLIN | POLLHUP)) == 0) {
+            break;
+        }
+        if (sys_read(0, &buf[n], 1) != 1) {
+            break;
+        }
+        n++;
+    }
+
+    return n;
+}
+
+static int parse_escape_sequence(unsigned long timeout_ticks) {
+    char first = 0;
+    if (read_byte_timeout(&first, timeout_ticks) != 0) {
+        return '\x1b';
+    }
+
+    if (first == '[') {
+        char ch = 0;
+        if (read_byte_timeout(&ch, timeout_ticks) != 0) {
+            return '\x1b';
+        }
+        if (ch >= '0' && ch <= '9') {
+            int param = 0;
+            int digits = 0;
+            while (ch >= '0' && ch <= '9') {
+                if (digits < 6) {
+                    param = (param * 10) + (ch - '0');
+                }
+                digits++;
+                if (read_byte_timeout(&ch, timeout_ticks) != 0) {
+                    return '\x1b';
+                }
+            }
+            if (ch == '~') {
+                switch (param) {
+                    case 1: return KEY_HOME;
+                    case 3: return KEY_DEL;
+                    case 4: return KEY_END;
+                    case 5: return KEY_PAGE_UP;
+                    case 6: return KEY_PAGE_DOWN;
+                    case 7: return KEY_HOME;
+                    case 8: return KEY_END;
+                    case 200: return KEY_BRACKETED_PASTE;
+                    case 201: return KEY_BRACKETED_PASTE_END;
+                }
+            } else {
+                while ((ch >= '0' && ch <= '9') || ch == ';') {
+                    if (read_byte_timeout(&ch, timeout_ticks) != 0) {
+                        return '\x1b';
+                    }
+                }
+                switch (ch) {
+                    case 'A': return KEY_ARROW_UP;
+                    case 'B': return KEY_ARROW_DOWN;
+                    case 'C': return KEY_ARROW_RIGHT;
+                    case 'D': return KEY_ARROW_LEFT;
+                    case 'H': return KEY_HOME;
+                    case 'F': return KEY_END;
+                }
+            }
+        } else if (ch == '?') {
+            do {
+                if (read_byte_timeout(&ch, timeout_ticks) != 0) {
+                    return '\x1b';
+                }
+            } while ((ch >= '0' && ch <= '9') || ch == ';' || ch == '?');
+            return '\x1b';
+        } else {
+            switch (ch) {
+                case 'A': return KEY_ARROW_UP;
+                case 'B': return KEY_ARROW_DOWN;
+                case 'C': return KEY_ARROW_RIGHT;
+                case 'D': return KEY_ARROW_LEFT;
+                case 'H': return KEY_HOME;
+                case 'F': return KEY_END;
+            }
+        }
+    } else if (first == 'O') {
+        char ch = 0;
+        if (read_byte_timeout(&ch, timeout_ticks) != 0) {
+            return '\x1b';
+        }
+        switch (ch) {
+            case 'H': return KEY_HOME;
+            case 'F': return KEY_END;
+        }
+    }
+
+    return '\x1b';
+}
+
+static void editor_queue_key(int key) {
+    if (E.pending_len >= (int)sizeof(E.pending_keys)) {
+        return;
+    }
+    E.pending_keys[E.pending_len++] = (unsigned char)key;
+}
+
+static void editor_queue_keys(const char *buf, int len) {
+    if (!buf || len <= 0) {
+        return;
+    }
+    for (int i = 0; i < len; i++) {
+        editor_queue_key((unsigned char)buf[i]);
+    }
+}
+
 static int write_all(int fd, const char *p, int want) {
     int done = 0;
     while (done < want) {
@@ -123,6 +252,14 @@ static void editor_set_status(const char *fmt, ...) {
 }
 
 static int editor_read_key(void) {
+    if (E.pending_len > 0) {
+        int key = E.pending_keys[0];
+        for (int i = 1; i < E.pending_len; i++) {
+            E.pending_keys[i - 1] = E.pending_keys[i];
+        }
+        E.pending_len--;
+        return key;
+    }
     char c = 0;
     if (read_byte(&c) != 0) {
         return '\x1b';
@@ -131,86 +268,7 @@ static int editor_read_key(void) {
     if (c != '\x1b') {
         return (int)c;
     }
-
-    char first = 0;
-    if (read_byte_timeout(&first, 1) != 0) {
-        return '\x1b';
-    }
-
-    if (first == '[') {
-        char ch = 0;
-        if (read_byte_timeout(&ch, 1) != 0) {
-            return '\x1b';
-        }
-        if (ch >= '0' && ch <= '9') {
-            int param = 0;
-            int digits = 0;
-            while (ch >= '0' && ch <= '9') {
-                if (digits < 6) {
-                    param = (param * 10) + (ch - '0');
-                }
-                digits++;
-                if (read_byte_timeout(&ch, 1) != 0) {
-                    return '\x1b';
-                }
-            }
-            if (ch == '~') {
-                switch (param) {
-                    case 1: return KEY_HOME;
-                    case 3: return KEY_DEL;
-                    case 4: return KEY_END;
-                    case 5: return KEY_PAGE_UP;
-                    case 6: return KEY_PAGE_DOWN;
-                    case 7: return KEY_HOME;
-                    case 8: return KEY_END;
-                    case 200: return KEY_BRACKETED_PASTE;
-                    case 201: return KEY_BRACKETED_PASTE_END;
-                }
-            } else {
-                while ((ch >= '0' && ch <= '9') || ch == ';') {
-                    if (read_byte_timeout(&ch, 1) != 0) {
-                        return '\x1b';
-                    }
-                }
-                switch (ch) {
-                    case 'A': return KEY_ARROW_UP;
-                    case 'B': return KEY_ARROW_DOWN;
-                    case 'C': return KEY_ARROW_RIGHT;
-                    case 'D': return KEY_ARROW_LEFT;
-                    case 'H': return KEY_HOME;
-                    case 'F': return KEY_END;
-                }
-            }
-        } else if (ch == '?') {
-            /* Consume private CSI sequence (e.g. ?2004h) fully. */
-            do {
-                if (read_byte_timeout(&ch, 1) != 0) {
-                    return '\x1b';
-                }
-            } while ((ch >= '0' && ch <= '9') || ch == ';' || ch == '?');
-            return '\x1b';
-        } else {
-            switch (ch) {
-                case 'A': return KEY_ARROW_UP;
-                case 'B': return KEY_ARROW_DOWN;
-                case 'C': return KEY_ARROW_RIGHT;
-                case 'D': return KEY_ARROW_LEFT;
-                case 'H': return KEY_HOME;
-                case 'F': return KEY_END;
-            }
-        }
-    } else if (first == 'O') {
-        char ch = 0;
-        if (read_byte_timeout(&ch, 1) != 0) {
-            return '\x1b';
-        }
-        switch (ch) {
-            case 'H': return KEY_HOME;
-            case 'F': return KEY_END;
-        }
-    }
-
-    return '\x1b';
+    return parse_escape_sequence(5);
 }
 
 static int row_reserve(editor_row_t *row, int need) {
@@ -771,6 +829,100 @@ static void editor_refresh(void) {
     term_write("\033[?25h");
 }
 
+static void editor_insert_paste_char(int c) {
+    if (c == '\r' || c == '\n') {
+        editor_insert_newline();
+        return;
+    }
+    if (c == '\t') {
+        editor_insert_char(' ');
+        editor_insert_char(' ');
+        editor_insert_char(' ');
+        editor_insert_char(' ');
+        return;
+    }
+    if (is_printable((char)c)) {
+        editor_insert_char((char)c);
+    }
+}
+
+static void editor_handle_bracketed_paste(void) {
+    static const char end_seq[] = "\x1b[201~";
+    char buf[256];
+    char pending[sizeof(end_seq)];
+    size_t pending_len = 0;
+    int saw_cr = 0;
+    size_t inserted = 0;
+
+    E.paste_mode = 1;
+    editor_set_status("pasting...");
+    editor_refresh();
+
+    for (;;) {
+        int n = read_burst(buf, (int)sizeof(buf), 30, 0);
+        if (n <= 0) {
+            editor_set_status("paste ended (timeout)");
+            break;
+        }
+
+        int finished = 0;
+        for (int i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)buf[i];
+
+        retry_byte:
+            if (pending_len > 0 || c == (unsigned char)end_seq[0]) {
+                if (c == (unsigned char)end_seq[pending_len]) {
+                    pending[pending_len++] = (char)c;
+                    if (pending_len == sizeof(end_seq) - 1U) {
+                        pending_len = 0;
+                        if (i + 1 < n) {
+                            editor_queue_keys(&buf[i + 1], (int)(n - i - 1));
+                        }
+                        editor_set_status("paste done");
+                        finished = 1;
+                        break;
+                    }
+                    continue;
+                }
+                for (size_t j = 0; j < pending_len; j++) {
+                    editor_insert_paste_char((unsigned char)pending[j]);
+                    inserted++;
+                }
+                pending_len = 0;
+                goto retry_byte;
+            }
+
+            if (c < 32U && c != '\n' && c != '\r' && c != '\t') {
+                editor_queue_key((int)c);
+                editor_set_status("paste interrupted");
+                finished = 1;
+                break;
+            }
+            if (saw_cr && c == '\n') {
+                saw_cr = 0;
+                continue;
+            }
+            saw_cr = (c == '\r');
+            editor_insert_paste_char((int)c);
+            inserted++;
+        }
+
+        if (finished) {
+            break;
+        }
+    }
+
+    for (size_t j = 0; j < pending_len; j++) {
+        editor_insert_paste_char((unsigned char)pending[j]);
+        inserted++;
+    }
+
+    E.paste_mode = 0;
+    if (inserted > 0 && strcmp(E.status, "pasting...") == 0) {
+        editor_set_status("paste done");
+    }
+}
+
 static void editor_move_cursor(int key) {
     editor_row_t *row = (E.cy >= 0 && E.cy < E.numrows) ? &E.rows[E.cy] : 0;
 
@@ -871,8 +1023,7 @@ static int editor_process_key(void) {
             editor_del_char();
             break;
         case KEY_BRACKETED_PASTE:
-            E.paste_mode = 1;
-            editor_set_status("pasting...");
+            editor_handle_bracketed_paste();
             break;
         case KEY_BRACKETED_PASTE_END:
             E.paste_mode = 0;
@@ -933,6 +1084,7 @@ static void editor_init(void) {
 }
 
 int main(int argc, char **argv) {
+    term_write("\033[?2004h");
     editor_init();
     if (argc > 1) {
         editor_open(argv[1]);
@@ -948,5 +1100,6 @@ int main(int argc, char **argv) {
             break;
         }
     }
+    term_write("\033[?2004l");
     return 0;
 }

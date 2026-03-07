@@ -14,6 +14,9 @@
 #include "virtio_blk.h"
 #include "ahci.h"
 #include "nvme.h"
+#include "rtl8139.h"
+#include "rtl8125.h"
+#include "net.h"
 #include "block_cache.h"
 
 void panic(const char *msg) {
@@ -57,6 +60,7 @@ void kernel_main(void) {
     mmu_init();
     trap_init();
     gic_init();
+    uart_enable_irq();
     timer_init(TIMER_HZ);
 
     task_init();
@@ -65,7 +69,10 @@ void kernel_main(void) {
     virtio_blk_init();
     ahci_init();
     nvme_init();
+    rtl8139_init();
+    rtl8125_init();
     block_cache_init();
+    net_init();
     fs_init();
 
     inode_t *init_elf = fs_lookup("/bin/init");

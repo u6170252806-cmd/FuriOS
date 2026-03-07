@@ -4,6 +4,7 @@
 #include "block_cache.h"
 #include "virtio_blk.h"
 #include "pmm.h"
+#include "task.h"
 #include "string.h"
 
 typedef struct {
@@ -31,6 +32,11 @@ static uint64_t pagecache_writeback_blocked_until;
 
 static bool pagecache_writeback_blocked(void);
 static void pagecache_note_writeback_result(bool success);
+static size_t pagecache_entry_max_bytes(const pagecache_entry_t *e);
+static bool pagecache_range_overlaps(const pagecache_entry_t *e, uint64_t start_off, uint64_t len);
+static bool pagecache_store_page_internal(inode_t *inode, uint64_t file_off,
+                                          const void *src_page, size_t max_bytes,
+                                          bool manage_ext4_tx);
 
 static uint64_t pagecache_touch_tick(void) {
     pagecache_clock++;
@@ -38,6 +44,34 @@ static uint64_t pagecache_touch_tick(void) {
         pagecache_clock = 1U;
     }
     return pagecache_clock;
+}
+
+static void pagecache_zero_tail(pagecache_entry_t *e, size_t keep_bytes) {
+    if (!e || !e->used || keep_bytes >= PAGE_SIZE) {
+        return;
+    }
+    memset((uint8_t *)(uintptr_t)e->pa + keep_bytes, 0, PAGE_SIZE - keep_bytes);
+    e->dirty = false;
+    e->last_touch = pagecache_touch_tick();
+}
+
+static bool pagecache_inode_same(const inode_t *a, const inode_t *b) {
+    if (a == b) {
+        return true;
+    }
+    if (!a || !b || a->type != b->type || a->fs_kind != b->fs_kind) {
+        return false;
+    }
+    if (a->type == INODE_DEV) {
+        return a->dev_kind == b->dev_kind &&
+               a->dev_lba_start == b->dev_lba_start &&
+               a->dev_lba_count == b->dev_lba_count;
+    }
+    if (a->fs_kind == FS_KIND_EXT4 && a->fs_id != 0U && b->fs_id != 0U &&
+        a->fs_ino != 0U && b->fs_ino != 0U) {
+        return a->fs_id == b->fs_id && a->fs_ino == b->fs_ino;
+    }
+    return false;
 }
 
 static bool pagecache_inode_supported(const inode_t *inode) {
@@ -104,7 +138,9 @@ static bool pagecache_load_page(inode_t *inode, uint64_t file_off, void *dst_pag
     return n >= 0;
 }
 
-static bool pagecache_store_page(inode_t *inode, uint64_t file_off, const void *src_page, size_t max_bytes) {
+static bool pagecache_store_page_internal(inode_t *inode, uint64_t file_off,
+                                          const void *src_page, size_t max_bytes,
+                                          bool manage_ext4_tx) {
     if (!inode || !src_page || !pagecache_inode_supported(inode) ||
         (file_off & (PAGE_SIZE - 1)) != 0 || max_bytes == 0U) {
         return false;
@@ -180,15 +216,30 @@ static bool pagecache_store_page(inode_t *inode, uint64_t file_off, const void *
     }
 
     size_t off = (size_t)file_off;
-    if (!ext4_tx_begin()) {
-        return false;
+    bool started_tx = false;
+    if (manage_ext4_tx) {
+        if (!ext4_tx_begin()) {
+            return false;
+        }
+        started_tx = true;
     }
     int wr = ext4_write(inode, &off, src_page, n);
-    if (wr != (int)n || !ext4_tx_commit()) {
+    if (wr != (int)n) {
+        if (started_tx) {
+            ext4_tx_abort();
+        }
+        return false;
+    }
+    if (started_tx && !ext4_tx_commit()) {
         ext4_tx_abort();
         return false;
     }
     return true;
+}
+
+static bool pagecache_store_page(inode_t *inode, uint64_t file_off,
+                                 const void *src_page, size_t max_bytes) {
+    return pagecache_store_page_internal(inode, file_off, src_page, max_bytes, true);
 }
 
 static pagecache_entry_t *pagecache_find(inode_t *inode, uint64_t file_off) {
@@ -196,7 +247,8 @@ static pagecache_entry_t *pagecache_find(inode_t *inode, uint64_t file_off) {
         if (!pagecache[i].used) {
             continue;
         }
-        if (pagecache[i].inode == inode && pagecache[i].file_off == file_off) {
+        if (pagecache_inode_same(pagecache[i].inode, inode) &&
+            pagecache[i].file_off == file_off) {
             return &pagecache[i];
         }
     }
@@ -224,16 +276,11 @@ static pagecache_entry_t *pagecache_slot(void) {
         return 0;
     }
     if (victim->dirty) {
-        size_t max_bytes = PAGE_SIZE;
-        if (victim->inode->size <= victim->file_off) {
+        size_t max_bytes = pagecache_entry_max_bytes(victim);
+        if (max_bytes == 0U) {
             victim->dirty = false;
         } else {
-            uint64_t rem = (uint64_t)victim->inode->size - victim->file_off;
-            if (rem < max_bytes) {
-                max_bytes = (size_t)rem;
-            }
-            if (max_bytes != 0U &&
-                !pagecache_store_page(victim->inode, victim->file_off,
+            if (!pagecache_store_page(victim->inode, victim->file_off,
                                       (const void *)(uintptr_t)victim->pa, max_bytes)) {
                 pagecache_note_writeback_result(false);
                 return 0;
@@ -245,6 +292,17 @@ static pagecache_entry_t *pagecache_slot(void) {
     pmm_free_page((void *)(uintptr_t)victim->pa);
     memset(victim, 0, sizeof(*victim));
     return victim;
+}
+
+static size_t pagecache_entry_max_bytes(const pagecache_entry_t *e) {
+    if (!e || !e->used || !e->inode) {
+        return 0U;
+    }
+    if (e->inode->size <= e->file_off) {
+        return 0U;
+    }
+    uint64_t rem = (uint64_t)e->inode->size - e->file_off;
+    return rem < PAGE_SIZE ? (size_t)rem : (size_t)PAGE_SIZE;
 }
 
 static bool pagecache_has_free_slot(void) {
@@ -260,23 +318,28 @@ static bool pagecache_entry_writeback(pagecache_entry_t *e) {
     if (!e || !e->used || !e->dirty) {
         return true;
     }
-    size_t max_bytes = PAGE_SIZE;
-    if (e->inode->size <= e->file_off) {
-        e->dirty = false;
-        return true;
-    }
-    uint64_t rem = (uint64_t)e->inode->size - e->file_off;
-    if (rem < max_bytes) {
-        max_bytes = (size_t)rem;
-    }
+    size_t max_bytes = pagecache_entry_max_bytes(e);
     if (max_bytes == 0U) {
+        if (e->inode->type == INODE_FILE) {
+            memset((void *)(uintptr_t)e->pa, 0, PAGE_SIZE);
+            if (!task_pagecache_writeprotect_shared(e->inode, e->file_off)) {
+                return false;
+            }
+        }
         e->dirty = false;
+        e->last_touch = pagecache_touch_tick();
         return true;
     }
     if (!pagecache_store_page(e->inode, e->file_off, (const void *)(uintptr_t)e->pa, max_bytes)) {
         return false;
     }
-    e->dirty = pmm_page_refcount((const void *)(uintptr_t)e->pa) > 1U;
+    if (e->inode->type == INODE_FILE && max_bytes < PAGE_SIZE) {
+        memset((uint8_t *)(uintptr_t)e->pa + max_bytes, 0, PAGE_SIZE - max_bytes);
+    }
+    if (!task_pagecache_writeprotect_shared(e->inode, e->file_off)) {
+        return false;
+    }
+    e->dirty = false;
     e->last_touch = pagecache_touch_tick();
     return true;
 }
@@ -335,7 +398,7 @@ static int pagecache_flush_match(inode_t *inode, uint64_t start_off, uint64_t le
             if (!e->used || !e->dirty) {
                 continue;
             }
-            if (inode && e->inode != inode) {
+            if (inode && !pagecache_inode_same(e->inode, inode)) {
                 continue;
             }
             if (use_range && !pagecache_range_overlaps(e, start_off, len)) {
@@ -455,7 +518,21 @@ bool pagecache_writeback(inode_t *inode, uint64_t file_off, uint64_t pa, size_t 
     if ((file_off & (PAGE_SIZE - 1)) != 0) {
         return false;
     }
-    if (max_bytes == 0) {
+    size_t valid_bytes = max_bytes;
+    if (valid_bytes > PAGE_SIZE) {
+        valid_bytes = PAGE_SIZE;
+    }
+    if (inode->type == INODE_FILE) {
+        uint64_t file_size = (uint64_t)inode->size;
+        if (file_off >= file_size) {
+            return true;
+        }
+        uint64_t rem = file_size - file_off;
+        if ((uint64_t)valid_bytes > rem) {
+            valid_bytes = (size_t)rem;
+        }
+    }
+    if (valid_bytes == 0U) {
         return true;
     }
 
@@ -474,12 +551,10 @@ bool pagecache_writeback(inode_t *inode, uint64_t file_off, uint64_t pa, size_t 
         pmm_ref_page((void *)(uintptr_t)pa);
         hit = slot;
     } else if (hit->pa != pa) {
-        memcpy((void *)(uintptr_t)hit->pa, (const void *)(uintptr_t)pa, PAGE_SIZE);
+        memcpy((void *)(uintptr_t)hit->pa, (const void *)(uintptr_t)pa, valid_bytes);
     }
-    (void)max_bytes;
-    uint64_t end = file_off + (uint64_t)max_bytes;
-    if (end > (uint64_t)inode->size) {
-        inode->size = (size_t)end;
+    if (inode->type == INODE_FILE && valid_bytes < PAGE_SIZE) {
+        memset((uint8_t *)(uintptr_t)hit->pa + valid_bytes, 0, PAGE_SIZE - valid_bytes);
     }
     hit->dirty = true;
     hit->last_touch = pagecache_touch_tick();
@@ -695,7 +770,7 @@ int pagecache_invalidate_inode_range(inode_t *inode, uint64_t start_off, uint64_
 
     for (int i = 0; i < MAX_FILE_CACHE_PAGES; i++) {
         pagecache_entry_t *e = &pagecache[i];
-        if (!e->used || e->inode != inode) {
+        if (!e->used || !pagecache_inode_same(e->inode, inode)) {
             continue;
         }
         if (!pagecache_range_overlaps(e, start_off, len)) {
@@ -747,7 +822,7 @@ void pagecache_invalidate_inode(inode_t *inode) {
         return;
     }
     for (int i = 0; i < MAX_FILE_CACHE_PAGES; i++) {
-        if (!pagecache[i].used || pagecache[i].inode != inode) {
+        if (!pagecache[i].used || !pagecache_inode_same(pagecache[i].inode, inode)) {
             continue;
         }
         /*
@@ -762,5 +837,48 @@ void pagecache_invalidate_inode(inode_t *inode) {
         }
         pmm_free_page((void *)(uintptr_t)pagecache[i].pa);
         memset(&pagecache[i], 0, sizeof(pagecache[i]));
+    }
+}
+
+void pagecache_invalidate_ext4_all(void) {
+    for (int i = 0; i < MAX_FILE_CACHE_PAGES; i++) {
+        if (!pagecache[i].used || !pagecache[i].inode ||
+            pagecache[i].inode->fs_kind != FS_KIND_EXT4) {
+            continue;
+        }
+        pmm_free_page((void *)(uintptr_t)pagecache[i].pa);
+        memset(&pagecache[i], 0, sizeof(pagecache[i]));
+    }
+}
+
+void pagecache_truncate_inode(inode_t *inode, size_t new_size) {
+    if (!inode || !pagecache_inode_supported(inode)) {
+        return;
+    }
+
+    uint64_t eof = (uint64_t)new_size;
+    uint64_t eof_page = eof & ~(uint64_t)(PAGE_SIZE - 1U);
+
+    for (int i = 0; i < MAX_FILE_CACHE_PAGES; i++) {
+        pagecache_entry_t *e = &pagecache[i];
+        if (!e->used || !pagecache_inode_same(e->inode, inode)) {
+            continue;
+        }
+
+        if (e->file_off >= eof) {
+            if (pmm_page_refcount((const void *)(uintptr_t)e->pa) > 1U) {
+                memset((void *)(uintptr_t)e->pa, 0, PAGE_SIZE);
+                e->dirty = false;
+                e->last_touch = pagecache_touch_tick();
+                continue;
+            }
+            pmm_free_page((void *)(uintptr_t)e->pa);
+            memset(e, 0, sizeof(*e));
+            continue;
+        }
+
+        if (e->file_off == eof_page && (eof & (PAGE_SIZE - 1U)) != 0U) {
+            pagecache_zero_tail(e, (size_t)(eof - eof_page));
+        }
     }
 }

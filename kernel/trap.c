@@ -8,8 +8,11 @@
 #include "virtio_blk.h"
 #include "ahci.h"
 #include "nvme.h"
+#include "rtl8139.h"
+#include "rtl8125.h"
 #include "pagecache.h"
 #include "ext4.h"
+#include "net.h"
 
 long syscall_dispatch(trapframe_t *tf, bool *force_resched);
 
@@ -103,6 +106,7 @@ trapframe_t *trap_handle_irq(trapframe_t *tf) {
         uint64_t now_ticks = timer_ticks();
         pagecache_tick(now_ticks);
         ext4_periodic_maintenance(now_ticks);
+        net_tick(now_ticks);
         if (task_wake_sleepers(now_ticks)) {
             force_resched = from_el0;
         }
@@ -118,6 +122,15 @@ trapframe_t *trap_handle_irq(trapframe_t *tf) {
             handled = true;
         }
         if (nvme_handle_irq(intid)) {
+            handled = true;
+        }
+        if (rtl8139_handle_irq(intid)) {
+            handled = true;
+        }
+        if (rtl8125_handle_irq(intid)) {
+            handled = true;
+        }
+        if (uart_handle_irq(intid)) {
             handled = true;
         }
         if (!handled && intid != 1023U) {

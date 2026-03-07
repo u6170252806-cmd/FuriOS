@@ -12,6 +12,19 @@ typedef long ssize_t;
 typedef long off_t;
 typedef int pid_t;
 typedef unsigned int mode_t;
+typedef struct {
+    uint32_t s_addr;
+} in_addr;
+
+typedef struct hostent {
+    char *h_name;
+    char **h_aliases;
+    int h_addrtype;
+    int h_length;
+    char **h_addr_list;
+} hostent;
+
+#define h_addr h_addr_list[0]
 
 typedef struct {
     char name[INODE_NAME_MAX + 1];
@@ -35,8 +48,23 @@ int sys_kill(int pid, int sig);
 int sys_sigaction(int sig, const fu_sigaction_t *act, fu_sigaction_t *oldact);
 int sys_sigprocmask(int how, uint64_t set, uint64_t *oldset);
 int sys_sigreturn(void);
+void __sigreturn_trampoline(void) __attribute__((noreturn));
 int sys_fcntl(int fd, int cmd, int arg);
 int sys_poll(fu_pollfd_t *fds, int nfds, unsigned long timeout_ticks);
+int sys_socket(int domain, int type, int protocol);
+int sys_bind(int fd, const fu_sockaddr_t *addr, unsigned long addrlen);
+long sys_sendto(int fd, const void *buf, unsigned long len, int flags,
+                const fu_sockaddr_t *dest_addr, unsigned long addrlen);
+long sys_recvfrom(int fd, void *buf, unsigned long len, int flags,
+                  fu_sockaddr_t *src_addr, unsigned long *addrlen);
+int sys_setsockopt(int fd, int level, int optname, const void *optval, unsigned long optlen);
+int sys_getsockopt(int fd, int level, int optname, void *optval, unsigned long *optlen);
+int sys_connect(int fd, const fu_sockaddr_t *addr, unsigned long addrlen);
+int sys_listen(int fd, int backlog);
+int sys_accept(int fd, fu_sockaddr_t *addr, unsigned long *addrlen);
+int sys_getsockname(int fd, fu_sockaddr_t *addr, unsigned long *addrlen);
+int sys_getpeername(int fd, fu_sockaddr_t *addr, unsigned long *addrlen);
+int sys_shutdown(int fd, int how);
 int sys_setpgid(int pid, int pgid);
 int sys_getpgid(int pid);
 void *sys_mmap(void *addr, unsigned long len, int prot, int flags, int fd, unsigned long offset);
@@ -117,6 +145,20 @@ int fstat(int fd, fu_stat_t *st);
 int chmod(const char *path, uint32_t mode);
 int fcntl(int fd, int cmd, int arg);
 int poll(fu_pollfd_t *fds, int nfds, unsigned long timeout_ticks);
+int socket(int domain, int type, int protocol);
+int bind(int fd, const fu_sockaddr_t *addr, unsigned long addrlen);
+long sendto(int fd, const void *buf, unsigned long len, int flags,
+            const fu_sockaddr_t *dest_addr, unsigned long addrlen);
+long recvfrom(int fd, void *buf, unsigned long len, int flags,
+              fu_sockaddr_t *src_addr, unsigned long *addrlen);
+int setsockopt(int fd, int level, int optname, const void *optval, unsigned long optlen);
+int getsockopt(int fd, int level, int optname, void *optval, unsigned long *optlen);
+int connect(int fd, const fu_sockaddr_t *addr, unsigned long addrlen);
+int listen(int fd, int backlog);
+int accept(int fd, fu_sockaddr_t *addr, unsigned long *addrlen);
+int getsockname(int fd, fu_sockaddr_t *addr, unsigned long *addrlen);
+int getpeername(int fd, fu_sockaddr_t *addr, unsigned long *addrlen);
+int shutdown(int fd, int how);
 int dup2(int oldfd, int newfd);
 int pipe(int fds[2]);
 int kill(int pid, int sig);
@@ -124,6 +166,7 @@ int sigaction(int sig, const fu_sigaction_t *act, fu_sigaction_t *oldact);
 int sigprocmask(int how, uint64_t set, uint64_t *oldset);
 int fork(void);
 int execv(const char *path, const char *const argv[]);
+int execve(const char *path, const char *const argv[], const char *const envp[]);
 int waitpid(int pid, int *status, int options);
 int wait(int *status);
 int getpid(void);
@@ -138,6 +181,19 @@ int fsync(int fd);
 int msync(void *addr, unsigned long len, unsigned long flags);
 int brk(void *addr);
 void *sbrk(long increment);
+void _exit(int code) __attribute__((noreturn));
 extern int errno;
+
+int inet_aton(const char *src, in_addr *out);
+unsigned long inet_addr(const char *src);
+char *inet_ntoa(in_addr in);
+int inet_pton(int af, const char *src, void *dst);
+const char *inet_ntop(int af, const void *src, char *dst, unsigned long size);
+hostent *gethostbyname(const char *name);
+int fu_parse_ipv4(const char *src, uint32_t *out_be);
+void fu_format_ipv4(uint32_t ip_be, char *buf, unsigned long size);
+int fu_resolver_nameserver(uint32_t *ip_be, uint16_t *port);
+int fu_resolve_name_ipv4(const char *name, uint32_t *out_be);
+int fu_resolve_name_ipv4_at(const char *name, uint32_t server_ip_be, uint16_t server_port, uint32_t *out_be);
 
 #endif
